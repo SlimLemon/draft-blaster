@@ -25,6 +25,23 @@ You should see `workbook locked`, `schema OK`, `DRAFT CO-PILOT attached` + READY
 7. Rename Team 2–14 now if you haven't (Team Tracker, blue column A). Winner codes
    `t2`–`t14` work by seat. **Also align `team_map` in espn_config.json to ESPN team IDs.**
 
+## Automated dry-run (always on a COPY)
+
+The co-pilot now runs each `--test` in an **isolated LibreOffice profile** with a
+free TCP port. This means:
+
+- Test runs **cannot** touch your live workbook.
+- Test runs **cannot** terminate a running co-pilot session.
+- If `soffice` crashed, the next `--test` automatically cleans up the orphan lock
+  and starts fresh.
+
+```
+copy Draft_Command_Center_DRAFT_DAY.xlsx draft_test_copy.xlsx
+& "C:\Program Files\LibreOffice\program\python.exe" draft_copilot.py --test draft_test_copy.xlsx
+```
+
+The test profile and port are created automatically — no manual cleanup needed.
+
 ## Commands
 
 | Type this | What happens |
@@ -78,14 +95,8 @@ python espn_probe.py --refresh-players
 - [ ] `espn_config.json` filled; `python espn_probe.py` succeeds
 - [ ] `team_map` verified against ESPN roster order
 - [ ] Exact file: `Draft_Command_Center_DRAFT_DAY.xlsx`
-- [ ] Automated dry-run on a **COPY**:
-
-```
-copy Draft_Command_Center_DRAFT_DAY.xlsx draft_test_copy.xlsx
-& "C:\Program Files\LibreOffice\program\python.exe" draft_copilot.py --test draft_test_copy.xlsx
-```
-
-- [ ] Live attach → `watch` → confirm “watch connected”
+- [ ] Automated dry-run on a **COPY** (uses isolated profile — see above)
+- [ ] Live attach → `watch` → confirm "watch connected"
 - [ ] Keep `LIVE_BACKUP_tonight.xlsx` as cold spare
 
 ---
