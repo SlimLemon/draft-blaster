@@ -56,10 +56,44 @@ def load_config(path=None):
     if missing:
         raise ConfigError("espn_config.json incomplete fields: %s" % ", ".join(missing))
     team_map = cfg.get("team_map") or {}
-    # normalize keys to int
-    cfg["team_map"] = {int(k): str(v).upper() for k, v in team_map.items()}
-    cfg["poll_seconds"] = float(cfg.get("poll_seconds") or 2)
-    cfg["autolog"] = bool(cfg.get("autolog") or False)
+    # normalize keys to int — reject non-dict types
+    if not isinstance(team_map, dict):
+        raise ConfigError("team_map must be a JSON object, got %s" % type(team_map).__name__)
+    try:
+        cfg["team_map"] = {int(k): str(v).upper() for k, v in team_map.items()}
+    except (TypeError, ValueError) as e:
+        raise ConfigError("team_map has invalid keys/values: %s" % e)
+    # poll_seconds: positive and bounded (0 < x <= 60)
+    raw_poll = cfg.get("poll_seconds")
+    if raw_poll is None:
+        raw_poll = 2
+    try:
+        poll = float(raw_poll)
+    except (TypeError, ValueError):
+        raise ConfigError("poll_seconds must be a number, got %r" % raw_poll)
+    if poll <= 0 or poll > 60:
+        raise ConfigError("poll_seconds must be > 0 and <= 60, got %s" % poll)
+    cfg["poll_seconds"] = poll
+    # autolog: parse booleans and accepted strings; "false" must not become True
+    raw_autolog = cfg.get("autolog")
+    if isinstance(raw_autolog, str):
+        low = raw_autolog.strip().lower()
+        if low in ("true", "1", "yes"):
+            cfg["autolog"] = True
+        elif low in ("false", "0", "no", ""):
+            cfg["autolog"] = False
+        else:
+            raise ConfigError("autolog must be a boolean or 'true'/'false', got %r"
+                              % raw_autolog)
+    else:
+        cfg["autolog"] = bool(raw_autolog or False)
+    # environment variable overrides for cookies
+    env_s2 = os.environ.get("DRAFT_COPILOT_ESPN_S2")
+    if env_s2:
+        cfg["espn_s2"] = env_s2
+    env_swid = os.environ.get("DRAFT_COPILOT_SWID")
+    if env_swid:
+        cfg["swid"] = env_swid
     cfg["season"] = int(cfg["season"])
     cfg["league_id"] = str(cfg["league_id"]).strip()
     return cfg
@@ -139,13 +173,33 @@ def extract_player_map(payload):
     return out
 
 
+CACHE_MAX_AGE_DAYS = 7  # draft-day maximum cache age
+
+
 def load_player_cache():
     if not os.path.isfile(PLAYER_CACHE_PATH):
         return {}
     try:
         with open(PLAYER_CACHE_PATH, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        return {int(k): str(v) for k, v in (raw or {}).items()}
+        # New metadata format: {season, fetched_at, players}
+        if isinstance(raw, dict) and "players" in raw:
+            season = raw.get("season")
+            fetched_at = raw.get("fetched_at", 0)
+            # Reject wrong-season cache
+            if season is not None and season != time.localtime().tm_year:
+                return {}
+            # Reject expired cache (> 7 days)
+            age_days = (time.time() - fetched_at) / 86400 if fetched_at else 999
+            if age_days > CACHE_MAX_AGE_DAYS:
+                return {}
+            players = raw["players"]
+            if isinstance(players, dict):
+                return {int(k): str(v) for k, v in players.items()}
+            return {}
+        # Legacy format: bare {id: name} map — treat as stale, return empty
+        # (will trigger a fresh fetch)
+        return {}
     except Exception:
         return {}
 
@@ -153,8 +207,13 @@ def load_player_cache():
 def save_player_cache(player_map):
     try:
         os.makedirs(os.path.dirname(PLAYER_CACHE_PATH), exist_ok=True)
+        data = {
+            "season": time.localtime().tm_year,
+            "fetched_at": time.time(),
+            "players": {str(k): v for k, v in player_map.items()},
+        }
         with open(PLAYER_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump({str(k): v for k, v in player_map.items()}, f)
+            json.dump(data, f)
     except Exception:
         pass
 
@@ -284,8 +343,8 @@ class EspnDraftWatcher(object):
 
     def fetch_state(self):
         url = draft_detail_url(self.cfg["league_id"], self.cfg["season"])
-        # 15s timeout: draft detail is a small response; 60s blocks stale detection
-        payload = fetch_json(url, self.cfg, timeout=15)
+        # 10s timeout: draft detail is a small response; well under 15s stale threshold
+        payload = fetch_json(url, self.cfg, timeout=10)
         self.ensure_player_map()
         nominee, completed, self._player_map = parse_draft_state(
             payload, self._player_map)
@@ -304,15 +363,9 @@ class EspnDraftWatcher(object):
             dd = (payload or {}).get("draftDetail") or {}
             for row in completed:
                 self._seen_sold_ids.add(row["pick_id"])
-                # Push into pending_sales so reconciliation can check the workbook
-                self.pending_sales.append({
-                    "pick_id": row["pick_id"],
-                    "name": row.get("name", ""),
-                    "winner_token": None,  # will be filled by handle_espn_sold
-                    "winner_disp": None,
-                    "price": row.get("bid", 0),
-                    "logged": False,
-                })
+                # Normalize with mapped winner token and price
+                sale = self._normalize_sale(row)
+                self.pending_sales.append(sale)
             if nominee:
                 self._last_nominee_key = (nominee["pick_id"], nominee["player_id"])
                 self.last_nominee = nominee
@@ -341,6 +394,22 @@ class EspnDraftWatcher(object):
             self._push(EVENT_ERROR, {"msg": "watch bootstrap failed: %s" % e})
             raise
 
+    def _normalize_sale(self, row):
+        """Normalize a completed pick into a standard sale record."""
+        team_id = row.get("team_id")
+        try:
+            tok = self.cfg.get("team_map", {}).get(int(team_id)) if team_id else None
+        except (TypeError, ValueError):
+            tok = None
+        return {
+            "pick_id": row.get("pick_id"),
+            "name": row.get("name", ""),
+            "winner_token": tok,
+            "winner_disp": tok,
+            "price": int(row.get("bid") or 0),
+            "logged": False,
+        }
+
     def _tick(self):
         nominee, completed, _payload = self.fetch_state()
         for row in completed:
@@ -348,8 +417,9 @@ class EspnDraftWatcher(object):
             if pid in self._seen_sold_ids:
                 continue
             self._seen_sold_ids.add(pid)
-            self.pending_sales.append(row)
-            self._push(EVENT_SOLD, row)
+            sale = self._normalize_sale(row)
+            self.pending_sales.append(sale)
+            self._push(EVENT_SOLD, sale)
         if nominee:
             key = (nominee["pick_id"], nominee["player_id"])
             prev = self.last_nominee

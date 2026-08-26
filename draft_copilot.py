@@ -1119,7 +1119,7 @@ def cmd_bang(cp):
     tok = sale.get("winner_token")
     if not tok or not sale.get("price"):
         say("? ESPN sale missing winner/price — log manually")
-        w.pending_sales.popleft()  # discard unprocessable entry
+        # Do NOT discard — leave in queue for manual resolution
         return
     name = sale.get("name") or ""
     p, cands = cp.resolve_player(name)
