@@ -262,12 +262,12 @@ def _recover_orphaned_lock():
     lock_path = os.path.join(PROFILE_DIR, ".lock")
     if not os.path.isfile(lock_path):
         return False
-    if soffice_process_running():
-        return False   # a real process holds the lock — don't touch it
-    # Also check port 2002: if something else is listening, don't interfere
+    # Only refuse recovery when OUR listener is up. An unrelated soffice
+    # window must not block clearing an orphaned Draft Copilot profile lock.
     if _port_in_use(PORT):
         return False
-    stale = lock_path + ".stale"
+    # Unique suffix so repeated recoveries never collide with .lock.stale
+    stale = "%s.stale.%d" % (lock_path, int(time.time() * 1000))
     try:
         os.rename(lock_path, stale)
         say("(recovered orphaned profile lock -> %s)" % os.path.basename(stale))

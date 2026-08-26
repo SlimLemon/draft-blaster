@@ -252,33 +252,29 @@ class TestOrphanLockRecovery(unittest.TestCase):
     def test_stale_name_includes_unique_suffix(self):
         """_recover_orphaned_lock must not always use .lock.stale — it should
         use a unique name to avoid collision on repeated recovery."""
-        import time as _time
-        lock_path = os.path.join(dc.PROFILE_DIR, ".lock")
-        # Simulate two rapid recoveries — each should produce a distinct name
-        # by using a timestamp or random suffix
-        stale1 = lock_path + ".stale.%d" % int(_time.time() * 1000)
-        stale2 = lock_path + ".stale.%d" % (int(_time.time() * 1000) + 1)
-        self.assertNotEqual(stale1, stale2,
-                            "consecutive stale names must differ")
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = os.path.join(td, ".lock")
+            open(lock_path, "w").close()
+            open(lock_path + ".stale", "w").close()  # prior recovery artifact
+            with mock.patch.object(dc, "PROFILE_DIR", td), \
+                 mock.patch.object(dc, "_port_in_use", return_value=False):
+                self.assertTrue(dc._recover_orphaned_lock())
+            self.assertFalse(os.path.isfile(lock_path))
+            stales = [n for n in os.listdir(td) if n.startswith(".lock.stale.")]
+            self.assertEqual(len(stales), 1, stales)
 
     def test_recovery_skips_when_unrelated_process_runs(self):
         """If an unrelated soffice process is running but not holding OUR
-        profile lock, recovery must still proceed."""
-        lock_path = os.path.join(dc.PROFILE_DIR, ".lock")
-        # An unrelated process running should not suppress recovery
-        # if OUR port is free and our lock is orphaned
-        with mock.patch.object(dc, "soffice_process_running", return_value=True), \
-             mock.patch.object(dc, "_port_in_use", return_value=False), \
-             mock.patch("os.path.isfile", return_value=True), \
-             mock.patch("os.rename") as mock_rename:
-            # The function should still rename the lock because our port is free
-            result = dc._recover_orphaned_lock()
-            # If recovery proceeded despite soffice running, rename was called
-            # If it didn't (because soffice_process_running blocks), that's
-            # also acceptable — but the spec says it should not be blocked
-            # by unrelated processes. We test the port-based check.
-        # The key invariant: _port_in_use is checked, not just process list
-        self.assertTrue(True)  # structure test — actual impl may vary
+        profile lock, recovery must still proceed when port 2002 is free."""
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = os.path.join(td, ".lock")
+            open(lock_path, "w").close()
+            with mock.patch.object(dc, "PROFILE_DIR", td), \
+                 mock.patch.object(dc, "soffice_process_running",
+                                   return_value=True), \
+                 mock.patch.object(dc, "_port_in_use", return_value=False):
+                self.assertTrue(dc._recover_orphaned_lock())
+            self.assertFalse(os.path.isfile(lock_path))
 
 
 class TestTestProcessOwnership(unittest.TestCase):
