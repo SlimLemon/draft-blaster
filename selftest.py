@@ -86,9 +86,9 @@ def run(cp):
     check("parse 'gibbs t7 34'",
           (n1, w1, pr1, s1) == ("gibbs", t7, 34, None),
           (n1, w1, pr1, s1))
-    n2, w2, pr2, s2 = cp.parse_sale("34 me rb2 olave")   # shuffled order
-    check("parse '34 me rb2 olave' (shuffled)",
-          (n2, w2, pr2, s2) == ("olave", me, 34, "RB2"),
+    n2, w2, pr2, s2 = cp.parse_sale("34 me wr2 olave")   # shuffled order
+    check("parse '34 me wr2 olave' (shuffled)",
+          (n2, w2, pr2, s2) == ("olave", me, 34, "WR2"),
           (n2, w2, pr2, s2))
     n3, w3, pr3, s3 = cp.parse_sale("$12 d/st me denver")
     check("parse '$12 d/st me denver' (d/st slot alias)",

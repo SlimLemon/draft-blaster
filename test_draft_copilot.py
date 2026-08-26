@@ -1,0 +1,196 @@
+import unittest
+from unittest import mock
+
+import draft_copilot as dc
+
+
+class SlotHarness:
+    def __init__(self, fills=None):
+        self.roster = object()
+        self._slots = [
+            "QB", "RB1", "RB2", "WR1", "WR2", "TE", "FLEX",
+            "D/ST", "K", "BE1", "BE2", "BE3", "BE4", "BE5", "BE6",
+        ]
+        self._fills = fills or [""] * len(self._slots)
+
+    def arr(self, _sheet, rng):
+        if rng == "A7:A21":
+            return tuple((value,) for value in self._slots)
+        if rng == "B7:B21":
+            return tuple((value,) for value in self._fills)
+        raise AssertionError(rng)
+
+
+class ParserHarness:
+    teams = {"ME": "ME", "T7": "PA"}
+    team_names = ["ME", "PA", "Brown Bombers"]
+
+    def resolve_winner(self, token):
+        return dc.Copilot.resolve_winner(self, token)
+
+    def resolve_player(self, fragment):
+        normalized = dc.norm(fragment)
+        known = {
+            "gibbs": {"name": "Jahmyr Gibbs"},
+            "chase brown": {"name": "Chase Brown"},
+            "brown": {"name": "Chase Brown"},
+        }
+        return (known.get(normalized), [])
+
+
+class TransactionHarness:
+    def __init__(self, heartbeat_delta=1, fail_price_once=False):
+        self.log = object()
+        self.cells = {"B5": "", "D5": "", "E5": "", "F5": "", "I5": ""}
+        self.pre = 0
+        self.heartbeat_delta = heartbeat_delta
+        self.fail_price_once = fail_price_once
+        self._price_failed = False
+
+    def next_entry_row(self):
+        return 5
+
+    def hq_get(self, addr):
+        if addr != "B15":
+            raise AssertionError(addr)
+        populated = bool(self.cells["B5"])
+        return self.pre + (self.heartbeat_delta if populated else 0)
+
+    def arr(self, _sheet, rng):
+        if rng in self.cells:
+            return ((self.cells[rng],),)
+        raise AssertionError(rng)
+
+    def set_str(self, _sheet, addr, value):
+        self.cells[addr] = str(value)
+
+    def set_num(self, _sheet, addr, value):
+        if addr == "E5" and self.fail_price_once and not self._price_failed:
+            self._price_failed = True
+            raise RuntimeError("simulated price failure")
+        self.cells[addr] = float(value)
+
+    def clear_cell(self, _sheet, addr):
+        self.cells[addr] = ""
+
+    def recalc(self):
+        pass
+
+    def hq_log_chk(self, _row):
+        return "LAST — CLEAR INPUTS TO UNDO" if self.cells["B5"] else ""
+
+
+class DoSaleHarness:
+    def __init__(self, heartbeat_ok):
+        self.teams = {"ME": "ME", "T7": "PA"}
+        self.players = [{
+            "name": "Jahmyr Gibbs", "owner": "Available", "pos": "RB",
+            "_norm": "jahmyr gibbs", "_toks": {"jahmyr", "gibbs"},
+        }]
+        self.team_names = ["ME", "PA"]
+        self.heartbeat_ok = heartbeat_ok
+        self.journal_calls = 0
+        self.autosave_calls = 0
+        self.refresh_calls = 0
+
+    def parse_sale(self, line):
+        return dc.Copilot.parse_sale(self, line)
+
+    def resolve_player(self, fragment):
+        return dc.Copilot.resolve_player(self, fragment)
+
+    def resolve_winner(self, token):
+        return dc.Copilot.resolve_winner(self, token)
+
+    def hq_get(self, _addr):
+        return 200
+
+    def suggest_slot(self, _pos):
+        return None
+
+    def validate_slot(self, _slot, _pos):
+        return True, ""
+
+    def write_sale(self, _p, _winner, _price, _slot):
+        return 5, self.heartbeat_ok, "LAST" if self.heartbeat_ok else "INCOMPLETE"
+
+    def journal_sale(self, _detail):
+        self.journal_calls += 1
+
+    def maybe_autosave(self):
+        self.autosave_calls += 1
+
+    def refresh_cache(self):
+        self.refresh_calls += 1
+
+    def status(self, tag=""):
+        pass
+
+
+class DraftCopilotRegressionTests(unittest.TestCase):
+    def test_empty_uno_rows_are_available_slots(self):
+        cp = SlotHarness()
+        self.assertEqual(dc.Copilot.validate_slot(cp, "RB2", "RB"), (True, ""))
+        self.assertEqual(dc.Copilot.validate_slot(cp, "QB", "QB"), (True, ""))
+        self.assertEqual(dc.Copilot.validate_slot(cp, "FLEX", "WR"), (True, ""))
+        self.assertEqual(dc.Copilot.suggest_slot(cp, "RB"), "RB1")
+
+    def test_occupied_and_ineligible_slots_are_rejected(self):
+        fills = [""] * 15
+        fills[2] = "Saquon Barkley"
+        cp = SlotHarness(fills)
+        self.assertIn("occupied", dc.Copilot.validate_slot(cp, "RB2", "RB")[1])
+        self.assertIn("not eligible", dc.Copilot.validate_slot(cp, "RB2", "WR")[1])
+
+    def test_named_winner_fragment_is_removed_before_player_resolution(self):
+        cp = ParserHarness()
+        self.assertEqual(
+            dc.Copilot.parse_sale(cp, "gibbs PA 34"),
+            ("gibbs", "PA", 34, None),
+        )
+        self.assertEqual(
+            dc.Copilot.parse_sale(cp, "chase brown t7 21 wr2"),
+            ("chase brown", "PA", 21, "WR2"),
+        )
+
+    def test_write_sale_rolls_back_partial_write_exception(self):
+        cp = TransactionHarness(fail_price_once=True)
+        row, ok, check = dc.Copilot.write_sale(
+            cp, {"name": "Jahmyr Gibbs"}, "PA", 34, None)
+        self.assertEqual(row, 5)
+        self.assertFalse(ok)
+        self.assertIn("WRITE FAILED", check)
+        self.assertEqual(cp.cells, {"B5": "", "D5": "", "E5": "", "F5": "", "I5": ""})
+
+    def test_write_sale_rolls_back_failed_heartbeat(self):
+        cp = TransactionHarness(heartbeat_delta=0)
+        row, ok, check = dc.Copilot.write_sale(
+            cp, {"name": "Jahmyr Gibbs"}, "PA", 34, None)
+        self.assertEqual(row, 5)
+        self.assertFalse(ok)
+        self.assertIn("HEARTBEAT", check)
+        self.assertEqual(cp.cells, {"B5": "", "D5": "", "E5": "", "F5": "", "I5": ""})
+
+    def test_do_sale_has_no_commit_side_effects_when_heartbeat_fails(self):
+        cp = DoSaleHarness(heartbeat_ok=False)
+        with mock.patch.object(dc, "say"):
+            result = dc.do_sale(cp, "gibbs t7 34")
+        self.assertFalse(result)
+        self.assertEqual(cp.journal_calls, 0)
+        self.assertEqual(cp.autosave_calls, 0)
+        self.assertEqual(cp.refresh_calls, 0)
+
+    def test_cleanup_steps_continue_after_watcher_stop_failure(self):
+        events = []
+        cp = mock.Mock()
+        cp.autosave.side_effect = lambda reason: events.append(("autosave", reason))
+        with mock.patch.object(dc, "cmd_watch_off", side_effect=RuntimeError("stop failed")), \
+                mock.patch.object(dc, "journal", side_effect=lambda event, detail="": events.append((event, detail))), \
+                mock.patch.object(dc, "say"):
+            dc.cleanup_session(cp)
+        self.assertIn(("autosave", "quit"), events)
+        self.assertIn(("SESSION_END", "ok"), events)
+
+
+if __name__ == "__main__":
+    unittest.main()

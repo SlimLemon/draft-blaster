@@ -520,10 +520,27 @@ class Copilot:
                     winner = w
                     continue
             name_toks.append(t)
+        # A Team Tracker name fragment (for example "PA") is also a valid
+        # winner token, but only consume it when removing it leaves a unique
+        # player match. This prevents a team fragment from stealing a player
+        # surname such as "Brown".
+        if winner is None and len(name_toks) >= 2:
+            for i, token in enumerate(name_toks):
+                w, _hits = self.resolve_winner(token)
+                if not w:
+                    continue
+                remaining = name_toks[:i] + name_toks[i + 1:]
+                if not remaining:
+                    continue
+                player, candidates = self.resolve_player(" ".join(remaining))
+                if player is not None or len(candidates) == 1:
+                    winner = w
+                    name_toks = remaining
+                    break
         return " ".join(name_toks), winner, price, slot
 
     def suggest_slot(self, pos):
-        fills = self.arr(self.roster, "B7:B21")
+        fills = [r[0] for r in self.arr(self.roster, "B7:B21")]
         slots = [r[0] for r in self.arr(self.roster, "A7:A21")]
         used = {s for s, f in zip(slots, fills) if f not in (None, "")}
         for cand in SLOT_ORDER.get(pos, []) + ["BE1", "BE2", "BE3",
@@ -547,12 +564,12 @@ class Copilot:
         if slot not in eligible:
             return False, "%s is not eligible for %s (valid: %s)" % (
                 slot, pos, ", ".join(eligible))
-        fills = self.arr(self.roster, "B7:B21")
+        fills = [r[0] for r in self.arr(self.roster, "B7:B21")]
         slots = [r[0] for r in self.arr(self.roster, "A7:A21")]
         for s, f in zip(slots, fills):
             if s == slot and f not in (None, ""):
                 return False, "slot %s already occupied by %s" % (slot, f)
-        return True, None
+        return True, ""
 
     # ---------------------------------------------------------------- actions
     def next_entry_row(self):
@@ -573,17 +590,50 @@ class Copilot:
     def write_sale(self, p, winner_disp, price, slot):
         row = self.next_entry_row()
         pre = self.hq_get("B15")
-        self.set_str(self.log, "B%d" % row, p["name"])
-        self.set_str(self.log, "D%d" % row, winner_disp)
-        self.set_num(self.log, "E%d" % row, price)
-        if slot:
-            self.set_str(self.log, "F%d" % row, slot)
-        self.recalc()
-        post = self.hq_get("B15")
-        chk = str(self.hq_log_chk(row))
-        ok = (isinstance(post, (int, float)) and isinstance(pre, (int, float))
-              and int(post) == int(pre) + 1 and "LAST" in chk)
-        return row, ok, chk
+        columns = ("B", "D", "E", "F", "I")
+        snapshot = {
+            col: self.arr(self.log, "%s%d" % (col, row))[0][0]
+            for col in columns
+        }
+
+        def rollback(reason):
+            restore_errors = []
+            for col in columns:
+                addr = "%s%d" % (col, row)
+                value = snapshot[col]
+                try:
+                    if value in (None, ""):
+                        self.clear_cell(self.log, addr)
+                    elif isinstance(value, (int, float)):
+                        self.set_num(self.log, addr, value)
+                    else:
+                        self.set_str(self.log, addr, value)
+                except Exception as e:
+                    restore_errors.append("%s: %s" % (addr, e))
+            try:
+                self.recalc()
+            except Exception as e:
+                restore_errors.append("recalc: %s" % e)
+            if restore_errors:
+                reason += " | ROLLBACK FAILED: " + "; ".join(restore_errors)
+            return row, False, reason
+
+        try:
+            self.set_str(self.log, "B%d" % row, p["name"])
+            self.set_str(self.log, "D%d" % row, winner_disp)
+            self.set_num(self.log, "E%d" % row, price)
+            if slot:
+                self.set_str(self.log, "F%d" % row, slot)
+            self.recalc()
+            post = self.hq_get("B15")
+            chk = str(self.hq_log_chk(row))
+            ok = (isinstance(post, (int, float)) and isinstance(pre, (int, float))
+                  and int(post) == int(pre) + 1 and "LAST" in chk)
+            if not ok:
+                return rollback("HEARTBEAT FAILED: %s" % chk)
+            return row, True, chk
+        except Exception as e:
+            return rollback("WRITE FAILED: %s" % e)
 
     def hq_log_chk(self, row):
         return self.arr(self.log, "J%d" % row)[0][0]
@@ -795,7 +845,7 @@ def attach(test_path=None):
 
 HELP = """
 COMMANDS
-  <player> [winner] [price] [slot]   e.g.  gibbs t7 34      | olave me 21 rb2
+  <player> [winner] [price] [slot]   e.g.  gibbs t7 34      | olave me 21 wr2
   who <player>      pre-bid briefing, loads nominee onto Draft HQ panel
   watch             start ESPN on-block sync (espn_config.json)
   watch off         stop ESPN watcher
@@ -1152,14 +1202,17 @@ def do_sale(cp, line):
             if slot:
                 say("(slot auto: %s)" % slot)
     row, ok, chk = cp.write_sale(p, winner, price, slot)
-    mark = "OK " if ok else "!! "
-    say("%sROW %d LOGGED: %s -> %s  $%d%s  [%s]" % (
-        mark, row, p["name"], winner, price,
+    if not ok:
+        say("!! ROW %d NOT COMMITTED: %s -> %s  $%d%s  [%s]" % (
+            row, p["name"], winner, price,
+            (" slot " + slot) if slot else "", chk.split("\n")[0][:80]))
+        say("!! sale was rolled back; correct the issue and retry")
+        return False
+    say("OK ROW %d LOGGED: %s -> %s  $%d%s  [%s]" % (
+        row, p["name"], winner, price,
         (" slot " + slot) if slot else "", chk.split("\n")[0][:40]))
     cp.journal_sale("row=%d player=%s winner=%s price=%d slot=%s heartbeat=%s" % (
         row, p["name"], winner, price, slot or "", "OK" if ok else "FAIL"))
-    if not ok:
-        say("!! HEARTBEAT: nomination count did not advance - check Calc!")
     cp.maybe_autosave()
     cp.refresh_cache()
     if winner == cp.teams.get("ME"):
@@ -1168,7 +1221,24 @@ def do_sale(cp, line):
         b = cp.hq_get
         say("budget $%s | max bid $%s | slots %s" %
             (num(b("B7")), num(b("B10")), num(b("B9"))))
-    return {"row": row, "heartbeat": ok}
+    return {"row": row, "heartbeat": True, "committed": True}
+
+
+def cleanup_session(cp):
+    """Run every shutdown step even if an earlier cleanup action fails."""
+    try:
+        cmd_watch_off(silent=True)
+    except Exception as e:
+        say("!! watcher shutdown failed: %s" % e)
+    try:
+        cp.autosave("quit")
+    except Exception as e:
+        say("!! final autosave failed: %s" % e)
+    try:
+        journal("SESSION_END", "ok")
+    except Exception as e:
+        say("!! session journal failed: %s" % e)
+    say("bye (workbook stays open)")
 
 
 def pick(prompt, cands):
@@ -1277,10 +1347,7 @@ def main():
     except (KeyboardInterrupt, EOFError):
         say("")
     finally:
-        cmd_watch_off(silent=True)
-        cp.autosave("quit")
-        journal("SESSION_END", "ok")
-        say("bye (workbook stays open)")
+        cleanup_session(cp)
 
 
 def test_keep_alive():
