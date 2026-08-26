@@ -1,0 +1,24 @@
+{
+  "league_id": "YOUR_LEAGUE_ID",
+  "season": 2026,
+  "espn_s2": "PASTE_espn_s2_COOKIE_HERE",
+  "swid": "{PASTE-SWID-COOKIE-HERE}",
+  "team_map": {
+    "1": "ME",
+    "2": "T2",
+    "3": "T3",
+    "4": "T4",
+    "5": "T5",
+    "6": "T6",
+    "7": "T7",
+    "8": "T8",
+    "9": "T9",
+    "10": "T10",
+    "11": "T11",
+    "12": "T12",
+    "13": "T13",
+    "14": "T14"
+  },
+  "poll_seconds": 2,
+  "autolog": false
+}

@@ -1,0 +1,18 @@
+# Live credentials and league-specific responses
+espn_config.json
+fixtures/espn_players_cache.json
+fixtures/mDraftDetail_live.json
+
+# Runtime state
+journal.txt
+*.lock
+*.lock.stale*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.benchmarks/
+.codex_audit_temp/
+
+# Local implementation isolation and generated verification output
+.worktrees/
+outputs/

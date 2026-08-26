@@ -1,0 +1,56 @@
+{
+  "draftDetail": {
+    "drafted": false,
+    "inProgress": true,
+    "picks": [
+      {
+        "id": 1,
+        "overallPickNumber": 1,
+        "playerId": 4427366,
+        "teamId": 3,
+        "nominatingTeamId": 7,
+        "bidAmount": 34,
+        "inProgress": false,
+        "keeper": false
+      },
+      {
+        "id": 2,
+        "overallPickNumber": 2,
+        "playerId": 3117251,
+        "teamId": 1,
+        "nominatingTeamId": 1,
+        "bidAmount": 12,
+        "inProgress": true,
+        "keeper": false
+      }
+    ]
+  },
+  "id": 123456789,
+  "seasonId": 2026,
+  "players": [
+    {
+      "id": 4427366,
+      "player": {
+        "id": 4427366,
+        "fullName": "Jahmyr Gibbs",
+        "defaultPositionId": 2
+      }
+    },
+    {
+      "id": 3117251,
+      "player": {
+        "id": 3117251,
+        "fullName": "Ja'Marr Chase",
+        "defaultPositionId": 3
+      }
+    },
+    {
+      "id": 2976499,
+      "player": {
+        "id": 2976499,
+        "fullName": "Christian McCaffrey",
+        "defaultPositionId": 2
+      }
+    }
+  ]
+}
