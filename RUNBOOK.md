@@ -64,7 +64,10 @@ If watch fails or mismatches a name: type `who <name>` manually. Always works.
 3. Grab cookies while logged into ESPN in Chrome (`espn_s2` + `SWID`).
 4. Fill `team_map` (ESPN teamId → `ME`/`T2`…`T14`) to match Team Tracker seats.
 5. Leave `autolog` **false** unless team_map is verified.
-6. Pre-check:
+6. Optional cookie overrides (preferred if you don’t want secrets on disk):
+   - `DRAFT_COPILOT_ESPN_S2`
+   - `DRAFT_COPILOT_SWID`
+7. Pre-check:
 
 ```
 python espn_probe.py --refresh-players
@@ -86,7 +89,16 @@ python espn_probe.py --refresh-players
 - **Journal:** `journal.txt` logs SALE / UNDO / AUTOSAVE / session.
 - Terminal died? Relaunch; Calc holds state; journal is the paper trail.
 - Watch died / `watch stale`? Keep drafting with manual `who` + sale lines; `!` refuses already-logged players (use `undo` if you mis-logged).
+- `!` only dequeues after a committed heartbeat — failed writes stay pending in the ESPN queue.
 - Nuclear fallback: type sales into Auction Log B/D/E/F by hand.
+
+## Preferred launch
+
+```
+.\launch_draft.ps1
+```
+
+Runs an isolated-copy selftest, then attaches to the live workbook. Use `-SkipTest` only if you already dry-ran.
 
 ## Pre-draft checklist
 

@@ -126,10 +126,17 @@ def run(cp):
     check("board owner flips to ME seat", owner == me, owner)
 
     jt, _ = cp.resolve_player("jonathan taylor")
-    row2, ok2, _ = cp.write_sale(jt, t7, 47, None)
-    check("sale 2 (T7) heartbeat OK", ok2)
+    # Rival takes RB2 with an explicit roster slot — must NOT populate My Roster.
+    row2, ok2, _ = cp.write_sale(jt, t7, 47, "RB2")
+    check("sale 2 (T7 RB2) heartbeat OK", ok2)
     spent_t7 = cp.arr(cp.tracker, "C11")[0][0]  # T7 seat is tracker row 11
     check("Team Tracker C11 spent = 47", spent_t7 == 47, spent_t7)
+    rival_rb2 = cp.arr(cp.roster, "B9")[0][0]
+    check("My Roster RB2 empty after rival T7 sale (ME-gate)",
+          rival_rb2 in (None, ""), repr(rival_rb2))
+    me_rb1 = cp.arr(cp.roster, "B8")[0][0]
+    check("My Roster RB1 still Gibbs after rival sale",
+          me_rb1 == "Jahmyr Gibbs", me_rb1)
 
     # --- duplicate guard data ----------------------------------------------
     dup, _ = cp.resolve_player("gibbs")

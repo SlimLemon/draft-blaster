@@ -33,6 +33,30 @@ if (!(Test-Path $LoPython)) {
     exit 1
 }
 
+$ConfigPath = Join-Path $ScriptDir "espn_config.json"
+$HasEnvCookies = $env:DRAFT_COPILOT_ESPN_S2 -and $env:DRAFT_COPILOT_SWID
+if (Test-Path $ConfigPath) {
+    Write-Host "espn_config.json: present (values not printed)"
+} elseif ($HasEnvCookies) {
+    Write-Host "espn_config.json: missing, but DRAFT_COPILOT_ESPN_S2 / DRAFT_COPILOT_SWID are set"
+} else {
+    Write-Host "WARNING: no espn_config.json and no cookie env vars — watch will fail; manual who/sales still work" -ForegroundColor Yellow
+}
+
+# Refuse to launch if something else already owns the default UNO port.
+$portBusy = $false
+try {
+    $listeners = Get-NetTCPConnection -LocalPort 2002 -State Listen -ErrorAction SilentlyContinue
+    if ($listeners) { $portBusy = $true }
+} catch {
+    $net = netstat -ano | Select-String ':2002\s+.*LISTENING'
+    if ($net) { $portBusy = $true }
+}
+if ($portBusy) {
+    Write-Host "ERROR: port 2002 already in use. Close LibreOffice / other co-pilot first." -ForegroundColor Red
+    exit 1
+}
+
 # ── Selftest (unless skipped) ──────────────────────────────────────
 if (!$SkipTest) {
     Write-Host "=== DRAFT CO-PILOT DRY RUN ===" -ForegroundColor Cyan

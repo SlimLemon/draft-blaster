@@ -16,3 +16,9 @@ __pycache__/
 # Local implementation isolation and generated verification output
 .worktrees/
 outputs/
+
+# Local workbook backups / disposable copies
+Draft_Command_Center_DRAFT_DAY.pre_*.xlsx
+draft_test_copy.xlsx
+_*.xlsx
+
