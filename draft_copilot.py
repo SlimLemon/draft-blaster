@@ -16,8 +16,21 @@ Commands:
   nom                              nomination helper (relays sheet's action+drains)
   status                           budget / needs / phase / threat snapshot
   log                              show last 5 logged sales
-  export                           dump draft results to timestamped CSV
+  export                           dump Auction Log results to timestamped CSV
   undo                             clear the last sale row
+
+In-season (ESPN live data):
+  standings                        live W/L record, points, rank
+  rosters [team]                   rosters + live scores (e.g. rosters t7)
+  fa [pos]                         free agents sorted by weekly points (e.g. fa rb)
+  matchups [week]                  head-to-head matchups (e.g. matchups 3)
+  injuries                         injury report across all teams
+  transactions                     recent adds/drops/trades
+  optimal [pos]                    compare your starters vs best available FA
+  waivers [pos]                    waiver wire targets
+  tradevalues                      draft prices as trade currency
+  cap [team]                       salary cap summary per team (e.g. cap me)
+
   help
 """
 import csv
@@ -333,6 +346,523 @@ def format_export_summary(rows, journal_only, spent):
     else:
         parts.append("journal-only: none")
     return " | ".join(parts)
+
+
+def espn_token_for_team_id(team_id, team_map):
+    """Map an ESPN integer team_id to the configured token string (e.g. 'T7').
+
+    team_map is {int: token_string} from espn_config.json (keys normalized
+    by load_config). Also handles string keys as a fallback.
+    """
+    if team_id is None:
+        return ""
+    try:
+        tid = int(team_id)
+    except (TypeError, ValueError):
+        return ""
+    tok = team_map.get(tid)
+    if tok is not None:
+        return tok
+    # fallback: try string key (in case team_map wasn't normalized)
+    return team_map.get(str(tid), "")
+
+
+def espn_label_for_team_id(team_id, team_labels):
+    """Map an ESPN integer team_id to its display label (e.g. 'PA').
+
+    team_labels may have int or string keys (JSON doesn't normalize them).
+    Falls back to '' if not found.
+    """
+    if team_id is None:
+        return ""
+    try:
+        tid = int(team_id)
+    except (TypeError, ValueError):
+        return ""
+    # try int key first, then string key
+    label = team_labels.get(tid)
+    if label is not None:
+        return label
+    return team_labels.get(str(tid), "")
+
+
+# --------------------------------------------------------------- in-season helpers
+def _espn_cfg():
+    """Load ESPN config. Returns None on error (caller should warn)."""
+    try:
+        from espn_watch import load_config
+        return load_config()
+    except Exception:
+        return None
+
+
+def run_espn_command(command, *args):
+    """Run an ESPN command only when its local config is available."""
+    cfg = _espn_cfg()
+    if cfg is None:
+        say("!! ESPN config unavailable; configure espn_config.json or cookie environment variables")
+        return None
+    return command(cfg, *args)
+
+
+POS_NAME = {1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "D/ST"}
+SLOT_NAME = {0: "QB", 2: "RB1", 3: "WR1", 4: "TE", 5: "FLEX",
+              16: "D/ST", 17: "FLEX", 20: "BEN", 21: "IR", 23: "OP",
+              24: "FLEX"}
+ACQ_SHORT = {"DRAFT": "D", "ADD": "A", "TRADE": "T"}
+
+
+def _espn_base(cfg):
+    return ("https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl"
+            "/seasons/%d" % cfg["season"])
+
+
+def _espn_url(cfg, path, **params):
+    base = _espn_base(cfg)
+    qs = "&".join("%s=%s" % (k, v) for k, v in params.items())
+    return "%s/segments/0/leagues/%s/%s?%s" % (base, cfg["league_id"], path, qs)
+
+
+def fetch_standings(cfg):
+    """Return list of team dicts: {id, abbrev, name, wins, losses, ties,
+    points_for, points_against, rank}. Sorted by rank."""
+    url = _espn_url(cfg, "teams", view="mTeam")
+    data = _espn_fetch_json(cfg, url)
+    tm = cfg.get("team_map") or {}
+    tl = cfg.get("team_labels") or {}
+    out = []
+    for t in data:
+        rec = (t.get("record") or {}).get("overall", {})
+        out.append({
+            "id": t["id"],
+            "abbrev": t.get("abbrev", ""),
+            "name": t.get("name", ""),
+            "token": espn_token_for_team_id(t["id"], tm),
+            "label": espn_label_for_team_id(t["id"], tl),
+            "wins": rec.get("wins", 0),
+            "losses": rec.get("losses", 0),
+            "ties": rec.get("ties", 0),
+            "points_for": round(t.get("points", 0), 2),
+            "points_against": round(rec.get("pointsAgainst", 0), 2),
+            "rank": t.get("currentProjectedRank", 0),
+        })
+    out.sort(key=lambda x: (x["rank"], -x["points_for"]))
+    return out
+
+
+def fetch_rosters(cfg, week=None):
+    """Return list of team dicts with roster entries.
+    Each team: {id, token, label, roster: [{name, pos, slot, pts, acq, status}]}."""
+    params = {"view": "mRoster"}
+    if week:
+        params["scoringPeriodId"] = str(week)
+    url = _espn_url(cfg, "teams", **params)
+    data = _espn_fetch_json(cfg, url)
+    tm = cfg.get("team_map") or {}
+    tl = cfg.get("team_labels") or {}
+    pmap, _ = _espn_build_player_map(cfg)
+    out = []
+    for t in data:
+        entries = (t.get("roster") or {}).get("entries", [])
+        roster = []
+        for e in entries:
+            ppe = e.get("playerPoolEntry") or {}
+            p = ppe.get("player") or {}
+            pid = p.get("id")
+            name = pmap.get(pid) or p.get("fullName") or ("player#%d" % pid) if pid else "?"
+            roster.append({
+                "name": name,
+                "pos": POS_NAME.get(p.get("defaultPositionId", 0), "?"),
+                "slot": SLOT_NAME.get(e.get("lineupSlotId", 0), "SLOT_%d" % e.get("lineupSlotId", 0)),
+                "pts": round(ppe.get("appliedStatTotal", 0) or 0, 1),
+                "acq": ACQ_SHORT.get(e.get("acquisitionType", ""), ""),
+                "status": e.get("injuryStatus", ""),
+            })
+        roster.sort(key=lambda r: (r["slot"] == "BEN", -r["pts"]))
+        out.append({
+            "id": t["id"],
+            "token": espn_token_for_team_id(t["id"], tm),
+            "label": espn_label_for_team_id(t["id"], tl),
+            "roster": roster,
+        })
+    out.sort(key=lambda x: x["token"])
+    return out
+
+
+def fetch_free_agents(cfg, week=None, pos=None, limit=25):
+    """Return list of free agent player dicts: {name, pos, pts, owned}.
+    Sorted by points descending."""
+    params = {"view": "players_wl", "sort": "appliedStatTotal:1",
+              "offset": "0", "limit": str(min(limit * 3, 200))}
+    if week:
+        params["scoringPeriodId"] = str(week)
+    url = _espn_url(cfg, "players", **params)
+    data = _espn_fetch_json(cfg, url)
+    pmap, _ = _espn_build_player_map(cfg)
+    out = []
+    for item in data:
+        ppe = item.get("playerPoolEntry") or item.get("player") or {}
+        p = ppe.get("player") or item.get("player") or {}
+        pid = p.get("id")
+        name = pmap.get(pid) or p.get("fullName") or ("player#%d" % pid) if pid else "?"
+        ppos = POS_NAME.get(p.get("defaultPositionId", 0), "?")
+        if pos and ppos.upper() != pos.upper():
+            continue
+        out.append({
+            "name": name,
+            "pos": ppos,
+            "pts": round(ppe.get("appliedStatTotal", 0) or 0, 1),
+            "owned": round(p.get("ownership", {}).get("percentOwned", 0) or 0, 1),
+        })
+    out.sort(key=lambda x: -x["pts"])
+    return out[:limit]
+
+
+def fetch_transactions(cfg, week=None):
+    """Return list of recent transaction dicts: {type, team, player, detail}."""
+    params = {}
+    if week:
+        params["scoringPeriodId"] = str(week)
+    url = _espn_url(cfg, "transactions", **params)
+    try:
+        data = _espn_fetch_json(cfg, url)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    tm = cfg.get("team_map") or {}
+    tl = cfg.get("team_labels") or {}
+    pmap, _ = _espn_build_player_map(cfg)
+    out = []
+    for tx in data:
+        tx_type = tx.get("type", "")
+        items = tx.get("items") or []
+        for item in items:
+            team_id = item.get("toTeamId") or item.get("fromTeamId")
+            player_list = item.get("players") or []
+            for pl in player_list:
+                pid = pl.get("playerId")
+                name = pmap.get(pid) or ("player#%d" % pid) if pid else "?"
+                out.append({
+                    "type": tx_type,
+                    "team": espn_label_for_team_id(team_id, tl) or espn_token_for_team_id(team_id, tm) or "?",
+                    "player": name,
+                    "detail": item.get("type", ""),
+                })
+    return out
+
+
+def fetch_matchups(cfg, week=None):
+    """Return list of matchup dicts for a scoring period.
+    Each: {home_team, away_team, home_score, away_score, home_id, away_id}."""
+    params = {}
+    if week:
+        params["matchupPeriodId"] = str(week)
+        params["mSPID"] = str(week)
+    url = _espn_url(cfg, "scoreboard", **params)
+    try:
+        data = _espn_fetch_json(cfg, url)
+    except Exception:
+        return []
+    tm = cfg.get("team_map") or {}
+    tl = cfg.get("team_labels") or {}
+    out = []
+    schedule = data.get("schedule") or []
+    for m in schedule:
+        home = m.get("home") or {}
+        away = m.get("away") or []
+        if isinstance(away, dict):
+            away_teams = [away]
+        elif isinstance(away, list):
+            away_teams = away
+        else:
+            away_teams = []
+        for a in away_teams:
+            hid = home.get("teamId")
+            aid = a.get("teamId")
+            out.append({
+                "home_id": hid,
+                "away_id": aid,
+                "home_team": espn_label_for_team_id(hid, tl) or espn_token_for_team_id(hid, tm),
+                "away_team": espn_label_for_team_id(aid, tl) or espn_token_for_team_id(aid, tm),
+                "home_score": round(home.get("totalPoints", 0) or 0, 1),
+                "away_score": round(a.get("totalPoints", 0) or 0, 1),
+            })
+    return out
+
+
+def _espn_fetch_json(cfg, url):
+    from espn_watch import fetch_json
+    return fetch_json(url, cfg, timeout=15)
+
+
+def _espn_build_player_map(cfg):
+    from espn_watch import build_player_map
+    return build_player_map(cfg)
+
+
+# ---------------------------------------------------------- in-season commands
+def cmd_standings(cfg):
+    """Print live standings sorted by rank."""
+    rows = fetch_standings(cfg)
+    if not rows:
+        say("!! could not fetch standings")
+        return
+    say("=" * 62)
+    say("  %-4s %-6s %-20s %5s %5s %5s  %8s %8s" % (
+        "Rk", "Token", "Name", "W", "L", "T", "PF", "PA"))
+    say("-" * 62)
+    for r in rows:
+        say("  %-4s %-6s %-20s %5d %5d %5d  %8.1f %8.1f" % (
+            r["rank"] or "-", r["token"], r["label"] or r["name"][:20],
+            r["wins"], r["losses"], r["ties"],
+            r["points_for"], r["points_against"]))
+    say("=" * 62)
+
+
+def cmd_rosters(cfg, args=""):
+    """Print rosters. Optional: team token (e.g. 'rosters t7')."""
+    token = args.strip().upper() if args.strip() else None
+    teams = fetch_rosters(cfg)
+    if not teams:
+        say("!! could not fetch rosters")
+        return
+    for t in teams:
+        if token and t["token"] != token:
+            continue
+        starters = [r for r in t["roster"] if r["slot"] not in ("BEN", "IR")]
+        bench = [r for r in t["roster"] if r["slot"] in ("BEN", "IR")]
+        total = sum(r["pts"] for r in t["roster"])
+        say("=" * 62)
+        say("  %s %s  (%d pts)" % (t["token"], t["label"], total))
+        say("  %-24s %-5s %-8s %6s" % ("Player", "Pos", "Slot", "Pts"))
+        say("  " + "-" * 50)
+        for r in starters:
+            say("  %-24s %-5s %-8s %6.1f%s" % (
+                r["name"][:24], r["pos"], r["slot"], r["pts"],
+                " *" if r["status"] not in ("NORMAL", "") else ""))
+        if bench:
+            say("  --- bench ---")
+            for r in bench:
+                say("  %-24s %-5s %-8s %6.1f%s" % (
+                    r["name"][:24], r["pos"], r["slot"], r["pts"],
+                    " *" if r["status"] not in ("NORMAL", "") else ""))
+    say("=" * 62)
+
+
+def cmd_freeagents(cfg, args=""):
+    """Print free agents sorted by weekly points. Optional: position filter."""
+    pos = args.strip().upper() if args.strip() else None
+    players = fetch_free_agents(cfg, pos=pos, limit=25)
+    if not players:
+        say("!! could not fetch free agents")
+        return
+    say("=" * 62)
+    title = "FREE AGENTS"
+    if pos:
+        title += " (%s)" % pos
+    say("  %s" % title)
+    say("  %-24s %-5s %6s %6s" % ("Player", "Pos", "Pts", "Own%"))
+    say("  " + "-" * 48)
+    for p in players:
+        say("  %-24s %-5s %6.1f %5.1f%%" % (
+            p["name"][:24], p["pos"], p["pts"], p["owned"]))
+    say("=" * 62)
+
+
+def cmd_transactions(cfg, args=""):
+    """Print recent transactions."""
+    txs = fetch_transactions(cfg)
+    if not txs:
+        say("no recent transactions (or endpoint not available)")
+        return
+    say("=" * 62)
+    say("  RECENT TRANSACTIONS")
+    say("  " + "-" * 50)
+    for tx in txs[:20]:
+        say("  %-6s %-6s %-24s %s" % (
+            tx["type"], tx["team"], tx["player"][:24], tx["detail"]))
+    say("=" * 62)
+
+
+def cmd_matchups(cfg, args=""):
+    """Print matchups for a week. Optional: week number."""
+    week = int(args.strip()) if args.strip().isdigit() else None
+    matchups = fetch_matchups(cfg, week=week)
+    if not matchups:
+        say("!! could not fetch matchups (week %s)" % (week or "current"))
+        return
+    title = "MATCHUPS"
+    if week:
+        title += " (Week %d)" % week
+    say("=" * 62)
+    say("  %s" % title)
+    say("  " + "-" * 50)
+    for m in matchups:
+        say("  %-8s %6.1f  vs  %-8s %6.1f" % (
+            m["home_team"], m["home_score"],
+            m["away_team"], m["away_score"]))
+    say("=" * 62)
+
+
+def cmd_injuries(cfg):
+    """Print injury report from all rosters."""
+    teams = fetch_rosters(cfg)
+    if not teams:
+        say("!! could not fetch rosters")
+        return
+    injuries = []
+    for t in teams:
+        for r in t["roster"]:
+            if r["status"] and r["status"] not in ("NORMAL", ""):
+                injuries.append({"team": t["token"], "label": t["label"],
+                                 "player": r["name"], "pos": r["pos"],
+                                 "status": r["status"]})
+    if not injuries:
+        say("  no injuries reported")
+        return
+    say("=" * 62)
+    say("  INJURY REPORT")
+    say("  " + "-" * 50)
+    for i in injuries:
+        say("  %-6s %-24s %-4s %s" % (
+            i["team"], i["player"][:24], i["pos"], i["status"]))
+    say("=" * 62)
+
+
+def cmd_optimal(cfg, args=""):
+    """Compare current starters vs best available at each position."""
+    pos = args.strip().upper() if args.strip() else None
+    teams = fetch_rosters(cfg)
+    fas = fetch_free_agents(cfg, limit=50)
+    if not teams:
+        say("!! could not fetch rosters")
+        return
+    # Find "ME" team
+    my = None
+    for t in teams:
+        if t["token"] == "ME":
+            my = t
+            break
+    if not my:
+        say("!! could not find your team (token=ME)")
+        return
+    say("=" * 62)
+    say("  LINEUP CHECK — %s" % my["label"])
+    say("  " + "-" * 50)
+    starters = [r for r in my["roster"] if r["slot"] not in ("BEN", "IR")]
+    for s in starters:
+        p = s["pos"]
+        if pos and p != pos:
+            continue
+        best_fa = [f for f in fas if f["pos"] == p and f["pts"] > s["pts"]]
+        if best_fa:
+            fa = best_fa[0]
+            say("  %-5s %-24s %5.1f  <-- FA: %-24s %5.1f (+%.1f)" % (
+                s["slot"], s["name"][:24], s["pts"],
+                fa["name"][:24], fa["pts"], fa["pts"] - s["pts"]))
+        else:
+            say("  %-5s %-24s %5.1f  (optimal)" % (
+                s["slot"], s["name"][:24], s["pts"]))
+    say("=" * 62)
+
+
+def cmd_waivers(cfg, args=""):
+    """Free agent targets sorted by points, filtered by position if given."""
+    # Reuse freeagents but with different display emphasis
+    cmd_freeagents(cfg, args)
+
+
+def cmd_tradevalues(cfg):
+    """Show draft prices as a trade-value reference for drafted players."""
+    from espn_watch import draft_detail_url
+    url = draft_detail_url(cfg["league_id"], cfg["season"])
+    payload = _espn_fetch_json(cfg, url)
+    pmap, _ = _espn_build_player_map(cfg)
+    tm = cfg.get("team_map") or {}
+    tl = cfg.get("team_labels") or {}
+    dd = payload.get("draftDetail") or {}
+    picks = dd.get("picks") or []
+    rows = []
+    for pick in picks:
+        pid = pick.get("playerId")
+        if pid is None or int(pid) <= 0:
+            continue
+        pid = int(pid)
+        bid = int(pick.get("bidAmount") or 0)
+        team_id = pick.get("teamId")
+        team_id_i = int(team_id) if team_id is not None else -1
+        if team_id_i <= 0 or bid <= 0:
+            continue
+        name = pmap.get(pid) or ("player#%d" % pid)
+        tok = espn_token_for_team_id(team_id, tm)
+        label = espn_label_for_team_id(team_id, tl)
+        # Try to get ESPN auction value from player data
+        rows.append({
+            "player": name,
+            "team": label or tok,
+            "bid": bid,
+        })
+    rows.sort(key=lambda x: -x["bid"])
+    if not rows:
+        say("!! could not parse draft data")
+        return
+    say("=" * 62)
+    say("  TRADE VALUES (draft price)")
+    say("  " + "-" * 50)
+    say("  %-24s %-6s %6s" % ("Player", "Team", "Price"))
+    say("  " + "-" * 50)
+    for r in rows:
+        say("  %-24s %-6s $%5d" % (r["player"][:24], r["team"], r["bid"]))
+    say("=" * 62)
+
+
+def cmd_cap(cfg, args=""):
+    """Salary cap summary per team. Optional: team token."""
+    requested_token = args.strip().upper() if args.strip() else None
+    from espn_watch import draft_detail_url
+    url = draft_detail_url(cfg["league_id"], cfg["season"])
+    payload = _espn_fetch_json(cfg, url)
+    tm = cfg.get("team_map") or {}
+    tl = cfg.get("team_labels") or {}
+    dd = payload.get("draftDetail") or {}
+    picks = dd.get("picks") or []
+    ds = (payload.get("settings") or {}).get("draftSettings") or {}
+    budget = ds.get("auctionBudget", 200)
+    # Aggregate spend per team
+    from collections import defaultdict
+    spend = defaultdict(lambda: {"token": "", "label": "", "total": 0, "count": 0})
+    for pick in picks:
+        pid = pick.get("playerId")
+        if pid is None or int(pid) <= 0:
+            continue
+        bid = int(pick.get("bidAmount") or 0)
+        team_id = pick.get("teamId")
+        team_id_i = int(team_id) if team_id is not None else -1
+        if team_id_i <= 0 or bid <= 0:
+            continue
+        team_token = espn_token_for_team_id(team_id, tm)
+        label = espn_label_for_team_id(team_id, tl) or team_token
+        team_key = team_token or label or "?"
+        spend[team_key]["token"] = team_token or team_key
+        spend[team_key]["label"] = label or team_key
+        spend[team_key]["total"] += bid
+        spend[team_key]["count"] += 1
+    if not spend:
+        say("!! could not parse draft data")
+        return
+    say("=" * 62)
+    say("  SALARY CAP (budget $%d)" % budget)
+    say("  %-6s %-20s %6s %5s %6s" % ("Team", "Name", "Spend", "#", "Left"))
+    say("  " + "-" * 55)
+    for team_key in sorted(spend.keys()):
+        s = spend[team_key]
+        left = budget - s["total"]
+        if requested_token and s["token"].upper() != requested_token:
+            continue
+        say("  %-6s %-20s $%4d %5d $%4d" % (
+            s["token"], s["label"], s["total"], s["count"], left))
+    say("=" * 62)
 
 
 # ------------------------------------------------------------------ uno layer
@@ -1063,8 +1593,21 @@ COMMANDS
   nom               nomination helper: sheet's action + top DRAIN names
   status            full snapshot (budget/needs/phase/threat)
   log               last 5 sales
-  export            dump draft results to timestamped CSV
+  export            dump Auction Log results to timestamped CSV
   undo              clear last sale row
+
+IN-SEASON (ESPN live data)
+  standings         live W/L record, points, rank
+  rosters [team]    rosters + live scores (e.g. rosters t7)
+  fa [pos]          free agents sorted by weekly points (e.g. fa rb)
+  matchups [week]   head-to-head matchups (e.g. matchups 3)
+  injuries          injury report across all teams
+  transactions      recent adds/drops/trades
+  optimal [pos]     compare your starters vs best available FA
+  waivers [pos]     waiver wire targets (alias for fa)
+  tradevalues       draft prices as trade currency
+  cap [team]        salary cap summary per team (e.g. cap me)
+
   help              this
 Winners: me, t2-t14, or name fragment. Slots: qb rb1 rb2 wr1 wr2 te flex d/st k be1-be6
 """
@@ -1547,6 +2090,44 @@ def main():
                     cp.export()
                 elif low.startswith("nom"):
                     cp.nom()
+                elif low.startswith("standings"):
+                    run_espn_command(cmd_standings)
+                elif low.startswith("rosters"):
+                    run_espn_command(cmd_rosters, line[7:])
+                elif low.startswith("freeagents") or low.startswith("fa"):
+                    run_espn_command(
+                        cmd_freeagents,
+                        line.split(None, 1)[-1] if len(line.split()) > 1 else "",
+                    )
+                elif low.startswith("transactions") or low.startswith("tx"):
+                    run_espn_command(
+                        cmd_transactions,
+                        line.split(None, 1)[-1] if len(line.split()) > 1 else "",
+                    )
+                elif low.startswith("matchups"):
+                    run_espn_command(
+                        cmd_matchups,
+                        line.split(None, 1)[-1] if len(line.split()) > 1 else "",
+                    )
+                elif low.startswith("injuries"):
+                    run_espn_command(cmd_injuries)
+                elif low.startswith("optimal"):
+                    run_espn_command(
+                        cmd_optimal,
+                        line.split(None, 1)[-1] if len(line.split()) > 1 else "",
+                    )
+                elif low.startswith("waivers"):
+                    run_espn_command(
+                        cmd_waivers,
+                        line.split(None, 1)[-1] if len(line.split()) > 1 else "",
+                    )
+                elif low.startswith("tradevalues") or low.startswith("trade"):
+                    run_espn_command(cmd_tradevalues)
+                elif low.startswith("cap"):
+                    run_espn_command(
+                        cmd_cap,
+                        line.split(None, 1)[-1] if len(line.split()) > 1 else "",
+                    )
                 elif not line:
                     pass
                 else:

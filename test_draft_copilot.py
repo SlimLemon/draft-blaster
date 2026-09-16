@@ -306,6 +306,7 @@ class TestFindOrOpenDocPathMatching(unittest.TestCase):
             os.path.join("C:\\Users\\Jared\\Draft blaster\\.worktrees\\draft-day-fixes", "foo.xlsx")))
         self.assertNotEqual(p1, p2)
 
+
 class DraftExportTests(unittest.TestCase):
     class _AuctionLogHarness:
         def __init__(self, grid, teams=None):
@@ -353,6 +354,13 @@ class DraftExportTests(unittest.TestCase):
         self.assertEqual(net, {"jahmyr gibbs", "puka nacua"})
         self.assertNotIn("old player", net)
         self.assertNotIn("ceedee lamb", net)
+
+    def test_espn_token_for_team_id(self):
+        team_map = {1: "ME", 7: "T7", 14: "T14"}
+        self.assertEqual(dc.espn_token_for_team_id(7, team_map), "T7")
+        self.assertEqual(dc.espn_token_for_team_id(1, team_map), "ME")
+        self.assertEqual(dc.espn_token_for_team_id(99, team_map), "")
+        self.assertEqual(dc.espn_token_for_team_id(None, team_map), "")
 
     def test_export_writes_csv_summary_and_journal_only(self):
         picks = [
@@ -481,6 +489,211 @@ class DraftExportTests(unittest.TestCase):
             self.assertEqual(len(rows), 0)
             summary = spoken[-1]
             self.assertIn("0 picks", summary)
+
+
+# ---- in-season command tests (no network, mock ESPN responses) ----
+
+_FAKE_CFG = {
+    "league_id": "123", "season": 2026,
+    "team_map": {1: "ME", 2: "T2", 17: "T11"},
+    "team_labels": {1: "ME", 2: "RD", 17: "KNOX"},
+}
+
+
+class InSeasonHelperTests(unittest.TestCase):
+    """Unit tests for in-season parsing helpers (no ESPN calls)."""
+
+    def test_espn_label_handles_int_and_str_keys(self):
+        tl_int = {1: "ME", 2: "RD"}
+        tl_str = {"1": "ME", "2": "RD"}
+        self.assertEqual(dc.espn_label_for_team_id(1, tl_int), "ME")
+        self.assertEqual(dc.espn_label_for_team_id(1, tl_str), "ME")
+        self.assertEqual(dc.espn_label_for_team_id(99, tl_int), "")
+        self.assertEqual(dc.espn_label_for_team_id(None, tl_int), "")
+
+    def test_fetch_standings_parses_team_data(self):
+        """Test standings parser with fake ESPN response."""
+        fake_teams = [
+            {"id": 1, "abbrev": "ME", "name": "My Team",
+             "points": 150.5, "currentProjectedRank": 1,
+             "record": {"overall": {"wins": 2, "losses": 0, "ties": 0,
+                                    "pointsAgainst": 120.0}}},
+            {"id": 2, "abbrev": "RD", "name": "Rival",
+             "points": 120.0, "currentProjectedRank": 2,
+             "record": {"overall": {"wins": 1, "losses": 1, "ties": 0,
+                                    "pointsAgainst": 130.0}}},
+        ]
+        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_teams):
+            rows = dc.fetch_standings(_FAKE_CFG)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["token"], "ME")
+        self.assertEqual(rows[0]["label"], "ME")
+        self.assertEqual(rows[0]["wins"], 2)
+        self.assertEqual(rows[0]["points_for"], 150.5)
+        self.assertEqual(rows[0]["rank"], 1)
+
+    def test_fetch_rosters_parses_entries(self):
+        fake_teams = [{
+            "id": 17,
+            "roster": {"entries": [
+                {"playerPoolEntry": {"player": {"id": 100, "fullName": "Josh Allen",
+                                                "defaultPositionId": 1},
+                                     "appliedStatTotal": 30.0},
+                 "lineupSlotId": 0, "acquisitionType": "DRAFT",
+                 "injuryStatus": "NORMAL"},
+                {"playerPoolEntry": {"player": {"id": 200, "fullName": "Bijan Robinson",
+                                                "defaultPositionId": 2},
+                                     "appliedStatTotal": 25.0},
+                 "lineupSlotId": 2, "acquisitionType": "DRAFT",
+                 "injuryStatus": "QUESTIONABLE"},
+            ]}
+        }]
+        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_teams), \
+             mock.patch("draft_copilot._espn_build_player_map", return_value=({100: "Josh Allen", 200: "Bijan Robinson"}, "")):
+            teams = dc.fetch_rosters(_FAKE_CFG)
+        self.assertEqual(len(teams), 1)
+        t = teams[0]
+        self.assertEqual(t["token"], "T11")
+        self.assertEqual(t["label"], "KNOX")
+        self.assertEqual(len(t["roster"]), 2)
+        # Starters first (non-BEN slots)
+        self.assertEqual(t["roster"][0]["name"], "Josh Allen")
+        self.assertEqual(t["roster"][0]["slot"], "QB")
+        self.assertEqual(t["roster"][0]["pts"], 30.0)
+        self.assertEqual(t["roster"][1]["status"], "QUESTIONABLE")
+
+    def test_fetch_free_agents_filters_by_pos(self):
+        fake_players = [
+            {"playerPoolEntry": {"player": {"id": 1, "fullName": "Josh Allen",
+                                            "defaultPositionId": 1,
+                                            "ownership": {"percentOwned": 99.0}},
+                                 "appliedStatTotal": 30.0}},
+            {"playerPoolEntry": {"player": {"id": 2, "fullName": "Bijan Robinson",
+                                            "defaultPositionId": 2,
+                                            "ownership": {"percentOwned": 98.0}},
+                                 "appliedStatTotal": 25.0}},
+        ]
+        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_players), \
+             mock.patch("draft_copilot._espn_build_player_map", return_value=({1: "Josh Allen", 2: "Bijan Robinson"}, "")):
+            all_fa = dc.fetch_free_agents(_FAKE_CFG)
+            rb_fa = dc.fetch_free_agents(_FAKE_CFG, pos="RB")
+        self.assertEqual(len(all_fa), 2)
+        self.assertEqual(len(rb_fa), 1)
+        self.assertEqual(rb_fa[0]["name"], "Bijan Robinson")
+
+    def test_fetch_matchups_parses_schedule(self):
+        fake_data = {"schedule": [
+            {"home": {"teamId": 1, "totalPoints": 150.0},
+             "away": {"teamId": 2, "totalPoints": 120.0}},
+        ]}
+        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_data):
+            matchups = dc.fetch_matchups(_FAKE_CFG)
+        self.assertEqual(len(matchups), 1)
+        m = matchups[0]
+        self.assertEqual(m["home_team"], "ME")
+        self.assertEqual(m["away_team"], "RD")
+        self.assertEqual(m["home_score"], 150.0)
+
+    def test_fetch_transactions_handles_empty(self):
+        with mock.patch("draft_copilot._espn_fetch_json", return_value=[]):
+            txs = dc.fetch_transactions(_FAKE_CFG)
+        self.assertEqual(txs, [])
+
+    def test_cmd_standings_prints(self):
+        fake_teams = [
+            {"id": 1, "abbrev": "ME", "name": "My Team",
+             "points": 150.5, "currentProjectedRank": 1,
+             "record": {"overall": {"wins": 2, "losses": 0, "ties": 0,
+                                    "pointsAgainst": 120.0}}},
+        ]
+        spoken = []
+        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_teams), \
+             mock.patch.object(dc, "say", side_effect=spoken.append):
+            dc.cmd_standings(_FAKE_CFG)
+        joined = "\n".join(spoken)
+        self.assertIn("ME", joined)
+        self.assertIn("150.5", joined)
+
+    def test_cmd_rosters_filters_by_token(self):
+        fake_teams = [
+            {"id": 1, "roster": {"entries": [
+                {"playerPoolEntry": {"player": {"id": 100, "fullName": "Josh Allen",
+                                                "defaultPositionId": 1},
+                                     "appliedStatTotal": 30.0},
+                 "lineupSlotId": 0, "acquisitionType": "DRAFT",
+                 "injuryStatus": "NORMAL"},
+            ]}},
+            {"id": 2, "roster": {"entries": [
+                {"playerPoolEntry": {"player": {"id": 200, "fullName": "Bijan Robinson",
+                                                "defaultPositionId": 2},
+                                     "appliedStatTotal": 25.0},
+                 "lineupSlotId": 2, "acquisitionType": "DRAFT",
+                 "injuryStatus": "NORMAL"},
+            ]}},
+        ]
+        spoken = []
+        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_teams), \
+             mock.patch("draft_copilot._espn_build_player_map", return_value=({100: "Josh Allen", 200: "Bijan Robinson"}, "")), \
+             mock.patch.object(dc, "say", side_effect=spoken.append):
+            dc.cmd_rosters(_FAKE_CFG, "ME")
+        joined = "\n".join(spoken)
+        self.assertIn("Josh Allen", joined)
+        self.assertNotIn("Bijan Robinson", joined)
+
+    def test_cmd_injuries_shows_only_injured(self):
+        fake_teams = [{
+            "id": 1, "roster": {"entries": [
+                {"playerPoolEntry": {"player": {"id": 100, "fullName": "Healthy Player",
+                                                "defaultPositionId": 2},
+                                     "appliedStatTotal": 10.0},
+                 "lineupSlotId": 2, "acquisitionType": "DRAFT",
+                 "injuryStatus": "NORMAL"},
+                {"playerPoolEntry": {"player": {"id": 200, "fullName": "Hurt Player",
+                                                "defaultPositionId": 3},
+                                     "appliedStatTotal": 5.0},
+                 "lineupSlotId": 3, "acquisitionType": "DRAFT",
+                 "injuryStatus": "OUT"},
+            ]}
+        }]
+        spoken = []
+        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_teams), \
+             mock.patch("draft_copilot._espn_build_player_map", return_value=({100: "Healthy", 200: "Hurt"}, "")), \
+             mock.patch.object(dc, "say", side_effect=spoken.append):
+            dc.cmd_injuries(_FAKE_CFG)
+        joined = "\n".join(spoken)
+        self.assertIn("Hurt", joined)
+        self.assertNotIn("Healthy", joined)
+
+    def test_cmd_cap_filters_by_canonical_team_token(self):
+        payload = {
+            "draftDetail": {"picks": [
+                {"playerId": 100, "bidAmount": 21, "teamId": 2},
+            ]},
+            "settings": {"draftSettings": {"auctionBudget": 200}},
+        }
+        spoken = []
+        with mock.patch("draft_copilot._espn_fetch_json", return_value=payload), \
+             mock.patch("draft_copilot._espn_build_player_map", return_value=({100: "Player One"}, "test")), \
+             mock.patch.object(dc, "say", side_effect=spoken.append):
+            dc.cmd_cap(_FAKE_CFG, "t2")
+        joined = "\n".join(spoken)
+        self.assertIn("T2", joined)
+        self.assertIn("RD", joined)
+        self.assertIn("$  21", joined)
+
+    def test_run_espn_command_reports_missing_config_without_calling_command(self):
+        calls = []
+        spoken = []
+
+        def command(config):
+            calls.append(config)
+
+        with mock.patch("draft_copilot._espn_cfg", return_value=None), \
+             mock.patch.object(dc, "say", side_effect=spoken.append):
+            result = dc.run_espn_command(command)
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
+        self.assertIn("ESPN config unavailable", "\n".join(spoken))
 
 
 if __name__ == "__main__":
