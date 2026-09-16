@@ -10,10 +10,8 @@ import json
 import os
 import sys
 
-from espn_watch import (
-    CONFIG_PATH, load_config, parse_draft_state, probe_to_file, ConfigError,
-    build_player_map, fetch_json,
-)
+from espn_watch import probe_to_file
+from espn_client import CONFIG_PATH, load_config, ConfigError, EspnClient
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                    "fixtures", "mDraftDetail_live.json")
@@ -28,7 +26,8 @@ def main():
         print("Copy espn_config.example.json -> espn_config.json and fill values.")
         return 2
     try:
-        summary = probe_to_file(cfg, OUT, refresh_players=refresh)
+        client = EspnClient(cfg)
+        summary = probe_to_file(cfg, OUT, refresh_players=refresh, client=client)
     except Exception as e:
         print("ERROR fetching ESPN:", e)
         return 1
@@ -62,7 +61,7 @@ def main():
         print("picks with real playerId:", len(real))
 
     # smoke: known star should resolve from map
-    pmap, _ = build_player_map(cfg)
+    pmap, _ = client.build_player_map()
     sample_ids = {
         4429795: "Ashton Jeanty",  # often #1 auction in 2026 kits; may vary
     }
@@ -78,15 +77,11 @@ def main():
         print("smoke name sample:", any_name)
 
     try:
-        teams_url = (
-            "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/%d"
-            "/segments/0/leagues/%s?view=mTeam"
-            % (cfg["season"], cfg["league_id"]))
-        tdata = fetch_json(teams_url, cfg)
+        tdata = client.league_views(("mTeam",))
         print("--- ESPN teams (align team_map / Team Tracker) ---")
         for t in sorted(tdata.get("teams") or [], key=lambda x: x.get("id", 0)):
             label = t.get("abbrev") or t.get("nickname") or "?"
-            mapped = (cfg.get("team_map") or {}).get(int(t["id"]), "?")
+            mapped = client.team_resolver().resolve(t["id"])["token"] or "?"
             mark = " <-- YOU" if mapped == "ME" else ""
             print("  espnId=%s  %-6s  -> %s%s" % (t.get("id"), label, mapped, mark))
     except Exception as e:

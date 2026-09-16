@@ -34,6 +34,7 @@ In-season (ESPN live data):
   help
 """
 import csv
+from espn_client import EspnClient, TeamResolver, valid_player_id
 import os
 import re
 import sys
@@ -349,48 +350,18 @@ def format_export_summary(rows, journal_only, spent):
 
 
 def espn_token_for_team_id(team_id, team_map):
-    """Map an ESPN integer team_id to the configured token string (e.g. 'T7').
-
-    team_map is {int: token_string} from espn_config.json (keys normalized
-    by load_config). Also handles string keys as a fallback.
-    """
-    if team_id is None:
-        return ""
-    try:
-        tid = int(team_id)
-    except (TypeError, ValueError):
-        return ""
-    tok = team_map.get(tid)
-    if tok is not None:
-        return tok
-    # fallback: try string key (in case team_map wasn't normalized)
-    return team_map.get(str(tid), "")
+    return TeamResolver(team_map).resolve(team_id)["token"]
 
 
 def espn_label_for_team_id(team_id, team_labels):
-    """Map an ESPN integer team_id to its display label (e.g. 'PA').
-
-    team_labels may have int or string keys (JSON doesn't normalize them).
-    Falls back to '' if not found.
-    """
-    if team_id is None:
-        return ""
-    try:
-        tid = int(team_id)
-    except (TypeError, ValueError):
-        return ""
-    # try int key first, then string key
-    label = team_labels.get(tid)
-    if label is not None:
-        return label
-    return team_labels.get(str(tid), "")
+    return TeamResolver(labels=team_labels).resolve(team_id)["label"]
 
 
 # --------------------------------------------------------------- in-season helpers
 def _espn_cfg():
     """Load ESPN config. Returns None on error (caller should warn)."""
     try:
-        from espn_watch import load_config
+        from espn_client import load_config
         return load_config()
     except Exception:
         return None
@@ -412,22 +383,11 @@ SLOT_NAME = {0: "QB", 2: "RB1", 3: "WR1", 4: "TE", 5: "FLEX",
 ACQ_SHORT = {"DRAFT": "D", "ADD": "A", "TRADE": "T"}
 
 
-def _espn_base(cfg):
-    return ("https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl"
-            "/seasons/%d" % cfg["season"])
-
-
-def _espn_url(cfg, path, **params):
-    base = _espn_base(cfg)
-    qs = "&".join("%s=%s" % (k, v) for k, v in params.items())
-    return "%s/segments/0/leagues/%s/%s?%s" % (base, cfg["league_id"], path, qs)
-
-
-def fetch_standings(cfg):
+def fetch_standings(cfg, client=None):
     """Return list of team dicts: {id, abbrev, name, wins, losses, ties,
     points_for, points_against, rank}. Sorted by rank."""
-    url = _espn_url(cfg, "teams", view="mTeam")
-    data = _espn_fetch_json(cfg, url)
+    client = client or EspnClient(cfg)
+    data = client.teams()
     tm = cfg.get("team_map") or {}
     tl = cfg.get("team_labels") or {}
     out = []
@@ -450,17 +410,14 @@ def fetch_standings(cfg):
     return out
 
 
-def fetch_rosters(cfg, week=None):
+def fetch_rosters(cfg, week=None, client=None):
     """Return list of team dicts with roster entries.
     Each team: {id, token, label, roster: [{name, pos, slot, pts, acq, status}]}."""
-    params = {"view": "mRoster"}
-    if week:
-        params["scoringPeriodId"] = str(week)
-    url = _espn_url(cfg, "teams", **params)
-    data = _espn_fetch_json(cfg, url)
+    client = client or EspnClient(cfg)
+    data = client.rosters(scoring_period=week)
     tm = cfg.get("team_map") or {}
     tl = cfg.get("team_labels") or {}
-    pmap, _ = _espn_build_player_map(cfg)
+    pmap, _ = client.build_player_map()
     out = []
     for t in data:
         entries = (t.get("roster") or {}).get("entries", [])
@@ -489,16 +446,12 @@ def fetch_rosters(cfg, week=None):
     return out
 
 
-def fetch_free_agents(cfg, week=None, pos=None, limit=25):
+def fetch_free_agents(cfg, week=None, pos=None, limit=25, client=None):
     """Return list of free agent player dicts: {name, pos, pts, owned}.
     Sorted by points descending."""
-    params = {"view": "players_wl", "sort": "appliedStatTotal:1",
-              "offset": "0", "limit": str(min(limit * 3, 200))}
-    if week:
-        params["scoringPeriodId"] = str(week)
-    url = _espn_url(cfg, "players", **params)
-    data = _espn_fetch_json(cfg, url)
-    pmap, _ = _espn_build_player_map(cfg)
+    client = client or EspnClient(cfg)
+    data = client.free_agents(scoring_period=week, limit=limit)
+    pmap, _ = client.build_player_map()
     out = []
     for item in data:
         ppe = item.get("playerPoolEntry") or item.get("player") or {}
@@ -518,21 +471,15 @@ def fetch_free_agents(cfg, week=None, pos=None, limit=25):
     return out[:limit]
 
 
-def fetch_transactions(cfg, week=None):
+def fetch_transactions(cfg, week=None, client=None):
     """Return list of recent transaction dicts: {type, team, player, detail}."""
-    params = {}
-    if week:
-        params["scoringPeriodId"] = str(week)
-    url = _espn_url(cfg, "transactions", **params)
-    try:
-        data = _espn_fetch_json(cfg, url)
-    except Exception:
-        return []
+    client = client or EspnClient(cfg)
+    data = client.transactions(scoring_period=week)
     if not isinstance(data, list):
         return []
     tm = cfg.get("team_map") or {}
     tl = cfg.get("team_labels") or {}
-    pmap, _ = _espn_build_player_map(cfg)
+    pmap, _ = client.build_player_map()
     out = []
     for tx in data:
         tx_type = tx.get("type", "")
@@ -552,18 +499,11 @@ def fetch_transactions(cfg, week=None):
     return out
 
 
-def fetch_matchups(cfg, week=None):
+def fetch_matchups(cfg, week=None, client=None):
     """Return list of matchup dicts for a scoring period.
     Each: {home_team, away_team, home_score, away_score, home_id, away_id}."""
-    params = {}
-    if week:
-        params["matchupPeriodId"] = str(week)
-        params["mSPID"] = str(week)
-    url = _espn_url(cfg, "scoreboard", **params)
-    try:
-        data = _espn_fetch_json(cfg, url)
-    except Exception:
-        return []
+    client = client or EspnClient(cfg)
+    data = client.scoreboard(week=week)
     tm = cfg.get("team_map") or {}
     tl = cfg.get("team_labels") or {}
     out = []
@@ -589,16 +529,6 @@ def fetch_matchups(cfg, week=None):
                 "away_score": round(a.get("totalPoints", 0) or 0, 1),
             })
     return out
-
-
-def _espn_fetch_json(cfg, url):
-    from espn_watch import fetch_json
-    return fetch_json(url, cfg, timeout=15)
-
-
-def _espn_build_player_map(cfg):
-    from espn_watch import build_player_map
-    return build_player_map(cfg)
 
 
 # ---------------------------------------------------------- in-season commands
@@ -773,12 +703,11 @@ def cmd_waivers(cfg, args=""):
     cmd_freeagents(cfg, args)
 
 
-def cmd_tradevalues(cfg):
+def cmd_tradevalues(cfg, client=None):
     """Show draft prices as a trade-value reference for drafted players."""
-    from espn_watch import draft_detail_url
-    url = draft_detail_url(cfg["league_id"], cfg["season"])
-    payload = _espn_fetch_json(cfg, url)
-    pmap, _ = _espn_build_player_map(cfg)
+    client = client or EspnClient(cfg)
+    payload = client.draft_detail()
+    pmap, _ = client.build_player_map()
     tm = cfg.get("team_map") or {}
     tl = cfg.get("team_labels") or {}
     dd = payload.get("draftDetail") or {}
@@ -786,7 +715,7 @@ def cmd_tradevalues(cfg):
     rows = []
     for pick in picks:
         pid = pick.get("playerId")
-        if pid is None or int(pid) <= 0:
+        if not valid_player_id(pid):
             continue
         pid = int(pid)
         bid = int(pick.get("bidAmount") or 0)
@@ -817,12 +746,11 @@ def cmd_tradevalues(cfg):
     say("=" * 62)
 
 
-def cmd_cap(cfg, args=""):
+def cmd_cap(cfg, args="", client=None):
     """Salary cap summary per team. Optional: team token."""
     requested_token = args.strip().upper() if args.strip() else None
-    from espn_watch import draft_detail_url
-    url = draft_detail_url(cfg["league_id"], cfg["season"])
-    payload = _espn_fetch_json(cfg, url)
+    client = client or EspnClient(cfg)
+    payload = client.draft_detail()
     tm = cfg.get("team_map") or {}
     tl = cfg.get("team_labels") or {}
     dd = payload.get("draftDetail") or {}
@@ -834,7 +762,7 @@ def cmd_cap(cfg, args=""):
     spend = defaultdict(lambda: {"token": "", "label": "", "total": 0, "count": 0})
     for pick in picks:
         pid = pick.get("playerId")
-        if pid is None or int(pid) <= 0:
+        if not valid_player_id(pid):
             continue
         bid = int(pick.get("bidAmount") or 0)
         team_id = pick.get("teamId")

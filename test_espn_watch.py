@@ -13,6 +13,16 @@ from collections import deque
 from unittest import mock
 
 import espn_watch as ew
+import espn_client as ec
+
+
+def setUpModule():
+    # Watcher tests exercise events, not the external catalog; client tests cover the cache.
+    patcher = mock.patch.object(ec.EspnClient, "build_player_map",
+                                return_value=({100: "Gibbs"}, "test"))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
 
 
 # ---------------------------------------------------------------------------
@@ -374,11 +384,10 @@ class TestCacheMetadata(unittest.TestCase):
             cache_path = os.path.join(td, "cache.json")
             with open(cache_path, "w") as f:
                 json.dump(cache_data, f)
-            with mock.patch.object(ew, "PLAYER_CACHE_PATH", cache_path):
-                result = ew.load_player_cache()
+            cfg = _make_cfg(season=2026)
+            client = ec.EspnClient(cfg, cache_path=cache_path)
+            result = client.load_player_cache()
         # Wrong season → must not load (returns empty or stale-filtered)
-        # The implementation should reject this; exact return depends on
-        # how it's coded, but the key contract is no stale data is trusted.
         self.assertIsInstance(result, dict)
 
     def test_load_player_cache_rejects_expired(self):
@@ -392,8 +401,9 @@ class TestCacheMetadata(unittest.TestCase):
             cache_path = os.path.join(td, "cache.json")
             with open(cache_path, "w") as f:
                 json.dump(cache_data, f)
-            with mock.patch.object(ew, "PLAYER_CACHE_PATH", cache_path):
-                result = ew.load_player_cache()
+            cfg = _make_cfg()
+            client = ec.EspnClient(cfg, cache_path=cache_path)
+            result = client.load_player_cache()
         self.assertIsInstance(result, dict)
 
     def test_legacy_cache_no_crash(self):
@@ -403,8 +413,9 @@ class TestCacheMetadata(unittest.TestCase):
             cache_path = os.path.join(td, "cache.json")
             with open(cache_path, "w") as f:
                 json.dump(legacy, f)
-            with mock.patch.object(ew, "PLAYER_CACHE_PATH", cache_path):
-                result = ew.load_player_cache()
+            cfg = _make_cfg()
+            client = ec.EspnClient(cfg, cache_path=cache_path)
+            result = client.load_player_cache()
         self.assertIsInstance(result, dict)
 
 
@@ -460,7 +471,7 @@ class TestFetchTimeout(unittest.TestCase):
         w = ew.EspnDraftWatcher(_make_cfg())
         w._player_map = {100: "Gibbs"}
         w._player_map_source = "test"
-        with mock.patch.object(ew, "fetch_json") as mock_fj:
+        with mock.patch.object(ec.EspnClient, "fetch_json") as mock_fj:
             mock_fj.return_value = _draft_payload([])
             w.fetch_state()
         # Check timeout was passed and is < 15

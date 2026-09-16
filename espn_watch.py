@@ -9,8 +9,6 @@ import json
 import os
 import threading
 import time
-import urllib.error
-import urllib.request
 from collections import deque
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -27,227 +25,11 @@ EVENT_STALE = "stale"      # polls failing ~15s+
 
 STALE_AFTER_S = 15.0
 
-PLAYER_CACHE_PATH = os.path.join(SCRIPT_DIR, "fixtures", "espn_players_cache.json")
-# ESPN returns ~11k with this filter; without it only ~50
-PLAYERS_FILTER = json.dumps({
-    "players": {
-        "limit": 20000,
-        "sortPercOwned": {"sortPriority": 1, "sortAsc": False},
-    }
-})
-
-
-class ConfigError(Exception):
-    pass
-
-
-def load_config(path=None):
-    path = path or CONFIG_PATH
-    if not os.path.isfile(path):
-        raise ConfigError(
-            "Missing %s — copy espn_config.example.json and fill league_id + cookies"
-            % path)
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    required = ("league_id", "season", "espn_s2", "swid")
-    missing = [k for k in required if not cfg.get(k)
-               or str(cfg.get(k)).startswith("YOUR_")
-               or str(cfg.get(k)).startswith("PASTE_")]
-    if missing:
-        raise ConfigError("espn_config.json incomplete fields: %s" % ", ".join(missing))
-    team_map = cfg.get("team_map") or {}
-    # normalize keys to int — reject non-dict types
-    if not isinstance(team_map, dict):
-        raise ConfigError("team_map must be a JSON object, got %s" % type(team_map).__name__)
-    try:
-        cfg["team_map"] = {int(k): str(v).upper() for k, v in team_map.items()}
-    except (TypeError, ValueError) as e:
-        raise ConfigError("team_map has invalid keys/values: %s" % e)
-    # poll_seconds: positive and bounded (0 < x <= 60)
-    raw_poll = cfg.get("poll_seconds")
-    if raw_poll is None:
-        raw_poll = 2
-    try:
-        poll = float(raw_poll)
-    except (TypeError, ValueError):
-        raise ConfigError("poll_seconds must be a number, got %r" % raw_poll)
-    if poll <= 0 or poll > 60:
-        raise ConfigError("poll_seconds must be > 0 and <= 60, got %s" % poll)
-    cfg["poll_seconds"] = poll
-    # autolog: parse booleans and accepted strings; "false" must not become True
-    raw_autolog = cfg.get("autolog")
-    if isinstance(raw_autolog, str):
-        low = raw_autolog.strip().lower()
-        if low in ("true", "1", "yes"):
-            cfg["autolog"] = True
-        elif low in ("false", "0", "no", ""):
-            cfg["autolog"] = False
-        else:
-            raise ConfigError("autolog must be a boolean or 'true'/'false', got %r"
-                              % raw_autolog)
-    else:
-        cfg["autolog"] = bool(raw_autolog or False)
-    # environment variable overrides for cookies
-    env_s2 = os.environ.get("DRAFT_COPILOT_ESPN_S2")
-    if env_s2:
-        cfg["espn_s2"] = env_s2
-    env_swid = os.environ.get("DRAFT_COPILOT_SWID")
-    if env_swid:
-        cfg["swid"] = env_swid
-    cfg["season"] = int(cfg["season"])
-    cfg["league_id"] = str(cfg["league_id"]).strip()
-    return cfg
-
-
-def draft_detail_url(league_id, season):
-    return (
-        "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/%d"
-        "/segments/0/leagues/%s?view=mDraftDetail&view=mRoster"
-        % (int(season), league_id)
-    )
-
-
-def players_url(season):
-    return (
-        "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/%d"
-        "/players?scoringPeriodId=0&view=players_wl" % int(season)
-    )
-
-
-def _cookie_header(cfg):
-    return "espn_s2=%s; SWID=%s" % (cfg["espn_s2"], cfg["swid"])
-
-
-def fetch_json(url, cfg, timeout=60, fantasy_filter=None):
-    headers = {
-        "User-Agent": "DraftCopilot/1.0",
-        "Accept": "application/json",
-        "Cookie": _cookie_header(cfg),
-    }
-    if fantasy_filter:
-        headers["X-Fantasy-Filter"] = fantasy_filter
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        ct = resp.headers.get("content-type", "")
-        raw = resp.read().decode("utf-8", errors="replace")
-    if "json" not in ct and "javascript" not in ct and not raw.lstrip().startswith("{") and not raw.lstrip().startswith("["):
-        # ESPN returned HTML (usually expired cookies / login page)
-        raise RuntimeError("ESPN returned HTML (content-type=%s) - cookies may be expired" % ct)
-    return json.loads(raw)
-
-
-def extract_player_map(payload):
-    """Build playerId -> fullName from mDraftDetail/players payloads."""
-    out = {}
-    if isinstance(payload, list):
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            pid = item.get("id")
-            name = item.get("fullName")
-            if isinstance(item.get("player"), dict):
-                name = name or item["player"].get("fullName")
-                pid = pid or item["player"].get("id")
-            if pid is not None and name:
-                out[int(pid)] = str(name)
-        return out
-    if not isinstance(payload, dict):
-        return out
-    for block in (payload.get("players"), payload.get("elements")):
-        if not isinstance(block, list):
-            continue
-        for item in block:
-            if not isinstance(item, dict):
-                continue
-            pid = item.get("id")
-            name = None
-            if isinstance(item.get("player"), dict):
-                name = item["player"].get("fullName")
-                pid = pid or item["player"].get("id")
-            name = name or item.get("fullName")
-            if pid is not None and name:
-                out[int(pid)] = str(name)
-    dd = payload.get("draftDetail") or {}
-    for pick in dd.get("picks") or []:
-        if not isinstance(pick, dict):
-            continue
-        pl = pick.get("player")
-        if isinstance(pl, dict) and pl.get("id") and pl.get("fullName"):
-            out[int(pl["id"])] = str(pl["fullName"])
-    return out
-
-
-CACHE_MAX_AGE_DAYS = 7  # draft-day maximum cache age
-
-
-def load_player_cache():
-    if not os.path.isfile(PLAYER_CACHE_PATH):
-        return {}
-    try:
-        with open(PLAYER_CACHE_PATH, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        # New metadata format: {season, fetched_at, players}
-        if isinstance(raw, dict) and "players" in raw:
-            season = raw.get("season")
-            fetched_at = raw.get("fetched_at", 0)
-            # Reject wrong-season cache
-            if season is not None and season != time.localtime().tm_year:
-                return {}
-            # Reject expired cache (> 7 days)
-            age_days = (time.time() - fetched_at) / 86400 if fetched_at else 999
-            if age_days > CACHE_MAX_AGE_DAYS:
-                return {}
-            players = raw["players"]
-            if isinstance(players, dict):
-                return {int(k): str(v) for k, v in players.items()}
-            return {}
-        # Legacy format: bare {id: name} map — treat as stale, return empty
-        # (will trigger a fresh fetch)
-        return {}
-    except Exception:
-        return {}
-
-
-def save_player_cache(player_map):
-    try:
-        os.makedirs(os.path.dirname(PLAYER_CACHE_PATH), exist_ok=True)
-        data = {
-            "season": time.localtime().tm_year,
-            "fetched_at": time.time(),
-            "players": {str(k): v for k, v in player_map.items()},
-        }
-        with open(PLAYER_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
-
-
-def build_player_map(cfg, force_refresh=False):
-    """Load id→name map: cache first, else ESPN players_wl (+ filter)."""
-    cached = load_player_cache()
-    if cached and len(cached) >= 500 and not force_refresh:
-        return cached, "cache"
-    url = players_url(cfg["season"])
-    # Prefer filtered full catalog; fall back to unfiltered 50-slice
-    try:
-        extra = fetch_json(url, cfg, fantasy_filter=PLAYERS_FILTER)
-        pmap = extract_player_map(extra)
-    except Exception:
-        pmap = {}
-    if len(pmap) < 500:
-        try:
-            extra = fetch_json(url, cfg)
-            pmap.update(extract_player_map(extra))
-        except Exception:
-            pass
-    if cached:
-        # merge so we never shrink on a partial fetch
-        merged = dict(cached)
-        merged.update(pmap)
-        pmap = merged
-    if len(pmap) >= 100:
-        save_player_cache(pmap)
-    return pmap, "espn"
+# Re-exports: draft_copilot.py and other scripts import these from espn_watch.
+from espn_client import (
+    EspnClient, ConfigError, load_config, draft_detail_url, players_url,
+    extract_player_map, map_team_token, valid_player_id,
+)
 
 
 def parse_draft_state(payload, player_map=None):
@@ -273,7 +55,7 @@ def parse_draft_state(payload, player_map=None):
         if not isinstance(pick, dict):
             continue
         pid = pick.get("playerId")
-        if pid is None or int(pid) <= 0:
+        if not valid_player_id(pid):
             continue
         pid = int(pid)
         team_id = pick.get("teamId")
@@ -302,17 +84,12 @@ def parse_draft_state(payload, player_map=None):
     return nominee, completed, player_map
 
 
-def map_team_token(team_id, team_map):
-    if team_id is None:
-        return None
-    return team_map.get(int(team_id))
-
-
 class EspnDraftWatcher(object):
     """Daemon poller; pushes events onto a thread-safe deque for the REPL."""
 
-    def __init__(self, cfg, events=None):
+    def __init__(self, cfg, events=None, client=None):
         self.cfg = cfg
+        self.client = client or EspnClient(cfg)
         self.events = events if events is not None else deque()
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -341,14 +118,13 @@ class EspnDraftWatcher(object):
     def ensure_player_map(self, force_refresh=False):
         if self._player_map and len(self._player_map) >= 500 and not force_refresh:
             return len(self._player_map)
-        self._player_map, self._player_map_source = build_player_map(
-            self.cfg, force_refresh=force_refresh)
+        self._player_map, self._player_map_source = self.client.build_player_map(
+            force_refresh=force_refresh)
         return len(self._player_map)
 
     def fetch_state(self):
-        url = draft_detail_url(self.cfg["league_id"], self.cfg["season"])
         # 10s timeout: draft detail is a small response; well under 15s stale threshold
-        payload = fetch_json(url, self.cfg, timeout=10)
+        payload = self.client.draft_detail(timeout=10)
         self.ensure_player_map()
         nominee, completed, self._player_map = parse_draft_state(
             payload, self._player_map)
@@ -401,10 +177,7 @@ class EspnDraftWatcher(object):
     def _normalize_sale(self, row):
         """Normalize a completed pick into a standard sale record."""
         team_id = row.get("team_id")
-        try:
-            tok = self.cfg.get("team_map", {}).get(int(team_id)) if team_id else None
-        except (TypeError, ValueError):
-            tok = None
+        tok = self.client.team_resolver().resolve(team_id)["token"] or None
         return {
             "pick_id": row.get("pick_id"),
             "name": row.get("name", ""),
@@ -495,11 +268,12 @@ class EspnDraftWatcher(object):
         return bool(self._thread and self._thread.is_alive())
 
 
-def probe_to_file(cfg, out_path, refresh_players=False):
+def probe_to_file(cfg, out_path, refresh_players=False, client=None):
     """Fetch live mDraftDetail and write JSON for inspection."""
-    pmap, src = build_player_map(cfg, force_refresh=refresh_players)
+    client = client or EspnClient(cfg)
+    pmap, src = client.build_player_map(force_refresh=refresh_players)
     url = draft_detail_url(cfg["league_id"], cfg["season"])
-    payload = fetch_json(url, cfg)
+    payload = client.draft_detail()
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     nominee, completed, pmap = parse_draft_state(payload, pmap)

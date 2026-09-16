@@ -523,7 +523,7 @@ class InSeasonHelperTests(unittest.TestCase):
              "record": {"overall": {"wins": 1, "losses": 1, "ties": 0,
                                     "pointsAgainst": 130.0}}},
         ]
-        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_teams):
+        with mock.patch("espn_client.EspnClient.fetch_json", return_value=fake_teams):
             rows = dc.fetch_standings(_FAKE_CFG)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["token"], "ME")
@@ -548,8 +548,8 @@ class InSeasonHelperTests(unittest.TestCase):
                  "injuryStatus": "QUESTIONABLE"},
             ]}
         }]
-        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_teams), \
-             mock.patch("draft_copilot._espn_build_player_map", return_value=({100: "Josh Allen", 200: "Bijan Robinson"}, "")):
+        with mock.patch("espn_client.EspnClient.fetch_json", return_value=fake_teams), \
+             mock.patch("espn_client.EspnClient.build_player_map", return_value=({100: "Josh Allen", 200: "Bijan Robinson"}, "")):
             teams = dc.fetch_rosters(_FAKE_CFG)
         self.assertEqual(len(teams), 1)
         t = teams[0]
@@ -573,8 +573,8 @@ class InSeasonHelperTests(unittest.TestCase):
                                             "ownership": {"percentOwned": 98.0}},
                                  "appliedStatTotal": 25.0}},
         ]
-        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_players), \
-             mock.patch("draft_copilot._espn_build_player_map", return_value=({1: "Josh Allen", 2: "Bijan Robinson"}, "")):
+        with mock.patch("espn_client.EspnClient.fetch_json", return_value=fake_players), \
+             mock.patch("espn_client.EspnClient.build_player_map", return_value=({1: "Josh Allen", 2: "Bijan Robinson"}, "")):
             all_fa = dc.fetch_free_agents(_FAKE_CFG)
             rb_fa = dc.fetch_free_agents(_FAKE_CFG, pos="RB")
         self.assertEqual(len(all_fa), 2)
@@ -586,7 +586,7 @@ class InSeasonHelperTests(unittest.TestCase):
             {"home": {"teamId": 1, "totalPoints": 150.0},
              "away": {"teamId": 2, "totalPoints": 120.0}},
         ]}
-        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_data):
+        with mock.patch("espn_client.EspnClient.fetch_json", return_value=fake_data):
             matchups = dc.fetch_matchups(_FAKE_CFG)
         self.assertEqual(len(matchups), 1)
         m = matchups[0]
@@ -595,7 +595,7 @@ class InSeasonHelperTests(unittest.TestCase):
         self.assertEqual(m["home_score"], 150.0)
 
     def test_fetch_transactions_handles_empty(self):
-        with mock.patch("draft_copilot._espn_fetch_json", return_value=[]):
+        with mock.patch("espn_client.EspnClient.fetch_json", return_value=[]):
             txs = dc.fetch_transactions(_FAKE_CFG)
         self.assertEqual(txs, [])
 
@@ -607,7 +607,7 @@ class InSeasonHelperTests(unittest.TestCase):
                                     "pointsAgainst": 120.0}}},
         ]
         spoken = []
-        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_teams), \
+        with mock.patch("espn_client.EspnClient.fetch_json", return_value=fake_teams), \
              mock.patch.object(dc, "say", side_effect=spoken.append):
             dc.cmd_standings(_FAKE_CFG)
         joined = "\n".join(spoken)
@@ -632,8 +632,8 @@ class InSeasonHelperTests(unittest.TestCase):
             ]}},
         ]
         spoken = []
-        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_teams), \
-             mock.patch("draft_copilot._espn_build_player_map", return_value=({100: "Josh Allen", 200: "Bijan Robinson"}, "")), \
+        with mock.patch("espn_client.EspnClient.fetch_json", return_value=fake_teams), \
+             mock.patch("espn_client.EspnClient.build_player_map", return_value=({100: "Josh Allen", 200: "Bijan Robinson"}, "")), \
              mock.patch.object(dc, "say", side_effect=spoken.append):
             dc.cmd_rosters(_FAKE_CFG, "ME")
         joined = "\n".join(spoken)
@@ -656,8 +656,8 @@ class InSeasonHelperTests(unittest.TestCase):
             ]}
         }]
         spoken = []
-        with mock.patch("draft_copilot._espn_fetch_json", return_value=fake_teams), \
-             mock.patch("draft_copilot._espn_build_player_map", return_value=({100: "Healthy", 200: "Hurt"}, "")), \
+        with mock.patch("espn_client.EspnClient.fetch_json", return_value=fake_teams), \
+             mock.patch("espn_client.EspnClient.build_player_map", return_value=({100: "Healthy", 200: "Hurt"}, "")), \
              mock.patch.object(dc, "say", side_effect=spoken.append):
             dc.cmd_injuries(_FAKE_CFG)
         joined = "\n".join(spoken)
@@ -672,8 +672,8 @@ class InSeasonHelperTests(unittest.TestCase):
             "settings": {"draftSettings": {"auctionBudget": 200}},
         }
         spoken = []
-        with mock.patch("draft_copilot._espn_fetch_json", return_value=payload), \
-             mock.patch("draft_copilot._espn_build_player_map", return_value=({100: "Player One"}, "test")), \
+        with mock.patch("espn_client.EspnClient.fetch_json", return_value=payload), \
+             mock.patch("espn_client.EspnClient.build_player_map", return_value=({100: "Player One"}, "test")), \
              mock.patch.object(dc, "say", side_effect=spoken.append):
             dc.cmd_cap(_FAKE_CFG, "t2")
         joined = "\n".join(spoken)
