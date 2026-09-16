@@ -128,7 +128,11 @@ def fetch_json(url, cfg, timeout=60, fantasy_filter=None):
         headers["X-Fantasy-Filter"] = fantasy_filter
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
+        ct = resp.headers.get("content-type", "")
         raw = resp.read().decode("utf-8", errors="replace")
+    if "json" not in ct and "javascript" not in ct and not raw.lstrip().startswith("{") and not raw.lstrip().startswith("["):
+        # ESPN returned HTML (usually expired cookies / login page)
+        raise RuntimeError("ESPN returned HTML (content-type=%s) - cookies may be expired" % ct)
     return json.loads(raw)
 
 

@@ -16,9 +16,11 @@ Commands:
   nom                              nomination helper (relays sheet's action+drains)
   status                           budget / needs / phase / threat snapshot
   log                              show last 5 logged sales
+  export                           dump draft results to timestamped CSV
   undo                             clear the last sale row
   help
 """
+import csv
 import os
 import re
 import sys
@@ -199,6 +201,138 @@ def assert_safe_test_path(path):
     if not os.path.isfile(abs_path):
         say("ERROR: test workbook not found: %s" % abs_path)
         sys.exit(2)
+
+
+# ----------------------------------------------------------- export helpers
+def collect_auction_log_rows(grid):
+    """Parse Auction Log grid (A:H rows) into list of row dicts.
+
+    Skips rows where column B (player) is empty.
+    Each dict: pick, player, winner, price, slot, winner_token.
+    """
+    rows = []
+    for r in grid:
+        pick, player, _c, winner, price, slot = r[0], r[1], r[2], r[3], r[4], r[5]
+        if player in (None, ""):
+            continue
+        rows.append({
+            "pick": pick,
+            "player": str(player),
+            "winner": str(winner) if winner not in (None, "") else "",
+            "price": int(price) if isinstance(price, (int, float)) else price,
+            "slot": str(slot) if slot not in (None, "") else "",
+        })
+    return rows
+
+
+def winner_token_for(display_name, teams):
+    """Reverse-lookup: given a Team Tracker display name, return the canonical token.
+
+    teams maps token -> display name, e.g. {"ME": "ME", "T7": "PA"}.
+    Returns the token string (e.g. "T7") or "" if not found.
+    """
+    for token, disp in teams.items():
+        if disp == display_name:
+            return token
+    return ""
+
+
+def net_session_journal_sales(journal_text):
+    """Return the set of normalized player names from the current journal session.
+
+    Scans journal lines after the last SESSION_START, applies SALE (add) and
+    UNDO (remove). Returns a set of lowercase normalized player names.
+    """
+    players = set()
+    in_session = False
+    for line in journal_text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        _ts, event, detail = parts[0], parts[1], parts[2]
+        if event == "SESSION_START":
+            in_session = True
+            players = set()
+        elif in_session and event == "SALE":
+            name = _extract_player_from_detail(detail)
+            if name:
+                players.add(norm(name))
+        elif in_session and event == "UNDO":
+            name = _extract_player_from_detail(detail)
+            if name:
+                players.discard(norm(name))
+    return players
+
+
+def _net_session_journal_display_names(journal_text):
+    """Like net_session_journal_sales but returns display names (original casing).
+
+    Used by export to produce human-readable journal-only output.
+    """
+    players = set()
+    in_session = False
+    for line in journal_text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        _ts, event, detail = parts[0], parts[1], parts[2]
+        if event == "SESSION_START":
+            in_session = True
+            players = set()
+        elif in_session and event == "SALE":
+            name = _extract_player_from_detail(detail)
+            if name:
+                players.add(name)
+        elif in_session and event == "UNDO":
+            name = _extract_player_from_detail(detail)
+            if name:
+                players.discard(name)
+    return players
+
+
+def _extract_player_from_detail(detail):
+    """Extract the player display name from a SALE/UNDO journal detail string.
+
+    Detail format: "row=N player=Some Name winner=Y price=Z ..."
+    Player name is everything between "player=" and " winner=".
+    """
+    marker = "player="
+    start = detail.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = detail.find(" winner=", start)
+    if end < 0:
+        return detail[start:].strip()
+    return detail[start:end].strip()
+
+
+def write_export_csv(path, rows):
+    """Write rows to a CSV file with the export header."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["pick", "player", "winner",
+                                                "winner_token", "price", "slot"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def format_export_summary(rows, journal_only, spent):
+    """Format the one-line export summary string."""
+    parts = ["export: %d picks" % len(rows)]
+    if spent:
+        parts.append("spent " + " ".join(
+            "%s=$%s" % (tok, amt) for tok, amt in spent))
+    if journal_only:
+        parts.append("journal-only: %s" % ", ".join(sorted(journal_only)))
+    else:
+        parts.append("journal-only: none")
+    return " | ".join(parts)
 
 
 # ------------------------------------------------------------------ uno layer
@@ -748,6 +882,80 @@ class Copilot:
             say("  #%s %-26s -> %-12s $%s" % (
                 num(r[0]), r[1], r[3], num(r[4])))
 
+    def export(self, out_dir=SCRIPT_DIR, journal_path=JOURNAL_PATH,
+               espn_picks=None):
+        """Export draft data to timestamped CSV.
+
+        Source: the attached Auction Log. Cross-checks the current-session
+        journal for integrity without opening another workbook connection or
+        making an ESPN request.
+
+        espn_picks: optional list of pick dicts (for testing / pre-fetched data).
+        Each dict: {player, winner_token, price, pick}.
+        """
+        rows = []
+        if espn_picks is not None:
+            # Pre-fetched picks passed only by deterministic unit tests.
+            for p in espn_picks:
+                rows.append({
+                    "pick": p.get("pick"),
+                    "player": p.get("player", ""),
+                    "winner": p.get("winner", ""),
+                    "winner_token": p.get("winner_token", ""),
+                    "price": int(p.get("price", 0)),
+                    "slot": "",
+                })
+        else:
+            try:
+                grid = self.arr(self.log, "A5:H%d" % LOG_LAST)
+            except Exception as e:
+                say("!! export failed: %s" % e)
+                return None
+            rows = collect_auction_log_rows(grid)
+            for r in rows:
+                r["winner_token"] = winner_token_for(r["winner"], self.teams)
+        # Read journal (current session only)
+        journal_available = True
+        journal_display_names = set()
+        try:
+            with open(journal_path, encoding="utf-8") as f:
+                journal_text = f.read()
+            journal_display_names = _net_session_journal_display_names(journal_text)
+        except Exception as e:
+            journal_available = False
+            say("(warn) journal unavailable: %s" % e)
+        # Journal-only: names in journal but NOT in picks (display names)
+        pick_names = {norm(r["player"]) for r in rows if r["player"]}
+        journal_only = {
+            name for name in journal_display_names if norm(name) not in pick_names
+        } if journal_available else set()
+        # Spend by winner_token
+        spent = {}
+        for r in rows:
+            tok = r["winner_token"] or "?"
+            spent[tok] = spent.get(tok, 0) + r["price"]
+        # Write CSV
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        stem = "draft_export_%s" % ts
+        csv_path = os.path.join(out_dir, stem + ".csv")
+        suffix = 1
+        while os.path.exists(csv_path):
+            csv_path = os.path.join(out_dir, "%s_%02d.csv" % (stem, suffix))
+            suffix += 1
+        try:
+            write_export_csv(csv_path, rows)
+        except Exception as e:
+            say("!! export failed: %s" % e)
+            return None
+        # Summary
+        summary = format_export_summary(rows, journal_only, sorted(spent.items()))
+        if not journal_available:
+            summary += " (journal unavailable)"
+        if espn_picks is None:
+            summary += " [source: Auction Log]"
+        say(summary)
+        return csv_path
+
     def reconcile_espn_picks(self, watcher):
         """Compare ESPN completed picks against the Auction Log on watch start.
 
@@ -855,6 +1063,7 @@ COMMANDS
   nom               nomination helper: sheet's action + top DRAIN names
   status            full snapshot (budget/needs/phase/threat)
   log               last 5 sales
+  export            dump draft results to timestamped CSV
   undo              clear last sale row
   help              this
 Winners: me, t2-t14, or name fragment. Slots: qb rb1 rb2 wr1 wr2 te flex d/st k be1-be6
@@ -1334,6 +1543,8 @@ def main():
                     cp.status()
                 elif low.startswith("log"):
                     cp.recent()
+                elif low.startswith("export"):
+                    cp.export()
                 elif low.startswith("nom"):
                     cp.nom()
                 elif not line:

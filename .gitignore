@@ -17,8 +17,11 @@ __pycache__/
 .worktrees/
 outputs/
 
+# Private ESPN exports and local draft-result CSVs
+exports/
+draft_export_*.csv
+
 # Local workbook backups / disposable copies
 Draft_Command_Center_DRAFT_DAY.pre_*.xlsx
 draft_test_copy.xlsx
 _*.xlsx
-

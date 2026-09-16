@@ -1,3 +1,4 @@
+import csv
 import os
 import tempfile
 import unittest
@@ -304,6 +305,182 @@ class TestFindOrOpenDocPathMatching(unittest.TestCase):
         p2 = os.path.normcase(os.path.abspath(
             os.path.join("C:\\Users\\Jared\\Draft blaster\\.worktrees\\draft-day-fixes", "foo.xlsx")))
         self.assertNotEqual(p1, p2)
+
+class DraftExportTests(unittest.TestCase):
+    class _AuctionLogHarness:
+        def __init__(self, grid, teams=None):
+            self.grid = grid
+            self.teams = teams or {"ME": "ME", "T7": "PA"}
+            self.log = object()
+
+        def arr(self, sheet, cell_range):
+            assert sheet is self.log
+            assert cell_range.startswith("A5:H")
+            return self.grid
+
+    def test_collect_auction_log_rows_skips_empty_player(self):
+        grid = [
+            (1, "Jahmyr Gibbs", None, "ME", 62, "RB1", None, None),
+            (2, "", None, "PA", 10, None, None, None),
+            (3, "CeeDee Lamb", None, "PA", 55, None, None, None),
+        ]
+        rows = dc.collect_auction_log_rows(grid)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["player"], "Jahmyr Gibbs")
+        self.assertEqual(rows[0]["pick"], 1)
+        self.assertEqual(rows[0]["winner"], "ME")
+        self.assertEqual(rows[0]["price"], 62)
+        self.assertEqual(rows[0]["slot"], "RB1")
+        self.assertEqual(rows[1]["player"], "CeeDee Lamb")
+
+    def test_winner_token_for_reverse_maps_display(self):
+        teams = {"ME": "ME", "T7": "PA", "T2": "Team 2"}
+        self.assertEqual(dc.winner_token_for("PA", teams), "T7")
+        self.assertEqual(dc.winner_token_for("ME", teams), "ME")
+        self.assertEqual(dc.winner_token_for("Unknown FC", teams), "")
+
+    def test_net_session_journal_sales_current_session_minus_undos(self):
+        text = "\n".join([
+            "2026-08-26 10:00:00\tSESSION_START\told.xlsx",
+            "2026-08-26 10:01:00\tSALE\trow=5 player=Old Player winner=ME price=10 slot=QB heartbeat=OK",
+            "2026-08-26 10:32:54\tSESSION_START\tDraft_Command_Center_DRAFT_DAY.xlsx",
+            "2026-08-26 10:32:54\tSALE\trow=5 player=Jahmyr Gibbs winner=ME price=62 slot=RB1 heartbeat=OK",
+            "2026-08-26 10:33:00\tSALE\trow=6 player=CeeDee Lamb winner=PA price=55 slot= heartbeat=OK",
+            "2026-08-26 10:34:00\tUNDO\trow=6 player=CeeDee Lamb winner=PA price=55.0 ok=True",
+            "2026-08-26 10:35:00\tSALE\trow=6 player=Puka Nacua winner=PA price=40 slot= heartbeat=OK",
+        ])
+        net = dc.net_session_journal_sales(text)
+        self.assertEqual(net, {"jahmyr gibbs", "puka nacua"})
+        self.assertNotIn("old player", net)
+        self.assertNotIn("ceedee lamb", net)
+
+    def test_export_writes_csv_summary_and_journal_only(self):
+        picks = [
+            {"pick": 1, "player": "Jahmyr Gibbs", "winner_token": "ME", "price": 62},
+            {"pick": 2, "player": "Puka Nacua", "winner_token": "T7", "price": 40},
+        ]
+        journal = "\n".join([
+            "2026-09-15 12:00:00\tSESSION_START\tcopy.xlsx",
+            "2026-09-15 12:01:00\tSALE\trow=5 player=Jahmyr Gibbs winner=ME price=62 slot=RB1 heartbeat=OK",
+            "2026-09-15 12:02:00\tSALE\trow=6 player=Puka Nacua winner=PA price=40 slot= heartbeat=OK",
+            "2026-09-15 12:03:00\tSALE\trow=7 player=Ghost Player winner=ME price=1 slot=BE1 heartbeat=OK",
+        ])
+        spoken = []
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "journal.txt")
+            with open(jpath, "w", encoding="utf-8") as f:
+                f.write(journal)
+            with mock.patch.object(dc, "say", side_effect=spoken.append):
+                path = dc.Copilot.export(None, out_dir=tmp, journal_path=jpath,
+                                         espn_picks=picks)
+            self.assertTrue(os.path.isfile(path))
+            self.assertTrue(os.path.basename(path).startswith("draft_export_"))
+            with open(path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["winner_token"], "ME")
+            self.assertEqual(rows[0]["player"], "Jahmyr Gibbs")
+            self.assertEqual(rows[1]["winner_token"], "T7")
+            self.assertEqual(rows[1]["player"], "Puka Nacua")
+            summary = spoken[-1]
+            self.assertIn("export: 2 picks", summary)
+            self.assertIn("ME=$62", summary)
+            self.assertIn("T7=$40", summary)
+            self.assertIn("Ghost Player", summary)
+
+    def test_export_defaults_to_attached_auction_log_without_espn_warning(self):
+        grid = [
+            (1, "Jahmyr Gibbs", None, "ME", 62, "RB1", None, None),
+            (2, "Puka Nacua", None, "PA", 40, "WR1", None, None),
+        ]
+        harness = self._AuctionLogHarness(grid)
+        spoken = []
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "journal.txt")
+            with open(jpath, "w", encoding="utf-8") as f:
+                f.write("2026-09-15 12:00:00\tSESSION_START\tcopy.xlsx\n")
+            with mock.patch.object(dc, "say", side_effect=spoken.append):
+                path = dc.Copilot.export(harness, out_dir=tmp, journal_path=jpath)
+            with open(path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        self.assertEqual([row["player"] for row in rows], ["Jahmyr Gibbs", "Puka Nacua"])
+        self.assertEqual(rows[1]["winner_token"], "T7")
+        self.assertIn("[source: Auction Log]", spoken[-1])
+        self.assertFalse(any("espn fetch failed" in message.lower() for message in spoken))
+
+    def test_export_same_second_uses_an_unused_filename(self):
+        picks = [{"pick": 1, "player": "Jahmyr Gibbs", "winner_token": "ME", "price": 62}]
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "journal.txt")
+            with open(jpath, "w", encoding="utf-8") as f:
+                f.write("2026-09-15 12:00:00\tSESSION_START\tcopy.xlsx\n")
+            with mock.patch.object(dc, "say"), \
+                    mock.patch.object(dc.time, "strftime", return_value="20260916_090000"):
+                first = dc.Copilot.export(None, out_dir=tmp, journal_path=jpath, espn_picks=picks)
+                second = dc.Copilot.export(None, out_dir=tmp, journal_path=jpath, espn_picks=picks)
+        self.assertEqual(os.path.basename(first), "draft_export_20260916_090000.csv")
+        self.assertEqual(os.path.basename(second), "draft_export_20260916_090000_01.csv")
+
+    def test_export_reconciles_journal_names_case_insensitively(self):
+        picks = [{"pick": 1, "player": "Jahmyr Gibbs", "winner_token": "ME", "price": 62}]
+        spoken = []
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "journal.txt")
+            with open(jpath, "w", encoding="utf-8") as f:
+                f.write("2026-09-15 12:00:00\tSESSION_START\tcopy.xlsx\n")
+                f.write("2026-09-15 12:01:00\tSALE\trow=5 player=jahmyr gibbs winner=ME price=62 slot=RB1 heartbeat=OK\n")
+            with mock.patch.object(dc, "say", side_effect=spoken.append):
+                dc.Copilot.export(None, out_dir=tmp, journal_path=jpath, espn_picks=picks)
+        self.assertIn("journal-only: none", spoken[-1])
+
+    def test_export_missing_journal_still_writes_csv(self):
+        picks = [
+            {"pick": 1, "player": "Jahmyr Gibbs", "winner_token": "ME", "price": 62},
+        ]
+        spoken = []
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "no_such_journal.txt")
+            with mock.patch.object(dc, "say", side_effect=spoken.append):
+                path = dc.Copilot.export(None, out_dir=tmp, journal_path=missing,
+                                         espn_picks=picks)
+            self.assertTrue(os.path.isfile(path))
+            joined = "\n".join(spoken).lower()
+            self.assertIn("journal unavailable", joined)
+
+    def test_export_two_runs_create_distinct_files(self):
+        picks = [
+            {"pick": 1, "player": "Jahmyr Gibbs", "winner_token": "ME", "price": 62},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "journal.txt")
+            with open(jpath, "w", encoding="utf-8") as f:
+                f.write("2026-09-15 12:00:00\tSESSION_START\tx.xlsx\n")
+            with mock.patch.object(dc, "say"):
+                with mock.patch.object(dc.time, "strftime", side_effect=["20260101_010101", "20260101_010102"]):
+                    p1 = dc.Copilot.export(None, out_dir=tmp, journal_path=jpath,
+                                           espn_picks=picks)
+                    p2 = dc.Copilot.export(None, out_dir=tmp, journal_path=jpath,
+                                           espn_picks=picks)
+            self.assertNotEqual(p1, p2)
+            self.assertTrue(os.path.isfile(p1))
+            self.assertTrue(os.path.isfile(p2))
+
+    def test_export_empty_picks_writes_header_only(self):
+        picks = []
+        spoken = []
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "journal.txt")
+            with open(jpath, "w", encoding="utf-8") as f:
+                f.write("2026-09-15 12:00:00\tSESSION_START\tx.xlsx\n")
+            with mock.patch.object(dc, "say", side_effect=spoken.append):
+                path = dc.Copilot.export(None, out_dir=tmp, journal_path=jpath,
+                                         espn_picks=picks)
+            self.assertTrue(os.path.isfile(path))
+            with open(path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 0)
+            summary = spoken[-1]
+            self.assertIn("0 picks", summary)
 
 
 if __name__ == "__main__":
